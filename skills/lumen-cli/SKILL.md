@@ -24,5 +24,5 @@ Use `lumen-cli` commands only.
 - Use `lumen-cli status` to get `cwd`; file paths returned by other commands are relative to it.
 - Use `--format json` or `--format json-pretty` when machine-readable output is needed.
 - Treat annotations as collaborative threads: lines without a prefix are user notes, lines starting with `Agent: ` are agent responses.
-- When responding to an annotation, append a new line starting with `Agent: ` and keep the existing content intact unless explicitly asked to replace it.
+- When responding to an annotation, append two newlines and then a line starting with `Agent: `; keep the existing content intact unless explicitly asked to replace it.
 - Surface errors exactly and suggest retrying once the API is reachable.
