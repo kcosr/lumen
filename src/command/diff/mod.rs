@@ -12,6 +12,7 @@ mod state;
 mod sticky_lines;
 pub mod theme;
 mod types;
+mod view_state;
 mod watcher;
 
 use std::collections::HashSet;

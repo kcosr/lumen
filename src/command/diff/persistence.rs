@@ -455,8 +455,8 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
             start: 0,
             end: side_by_side.len(),
         });
-    let (change_start, change_end) =
-        hunk_change_bounds(&side_by_side, hunk_range).unwrap_or((hunk_range.start, hunk_range.end.saturating_sub(1)));
+    let (change_start, change_end) = hunk_change_bounds(&side_by_side, hunk_range)
+        .unwrap_or((hunk_range.start, hunk_range.end.saturating_sub(1)));
 
     let context_before: Vec<String> = side_by_side
         .get(change_start.saturating_sub(CONTEXT_LINES)..change_start)
@@ -532,8 +532,7 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
 
     let context_after: Vec<String> = side_by_side
         .get(
-            change_end
-                .saturating_add(1)
+            change_end.saturating_add(1)
                 ..change_end
                     .saturating_add(1)
                     .saturating_add(CONTEXT_LINES)

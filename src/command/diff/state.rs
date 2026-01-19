@@ -423,7 +423,8 @@ impl AppState {
                     &diff.new_content,
                     self.settings.tab_width,
                 );
-                let hunk_count = find_hunk_ranges(&side_by_side, self.settings.unified_context).len();
+                let hunk_count =
+                    find_hunk_ranges(&side_by_side, self.settings.unified_context).len();
                 (diff.filename.as_str(), (idx, hunk_count))
             })
             .collect();

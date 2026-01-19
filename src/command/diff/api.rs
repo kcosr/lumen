@@ -52,7 +52,6 @@ pub fn start_api_server(
     command_tx: Sender<ApiCommand>,
 ) -> io::Result<thread::JoinHandle<()>> {
     let server = Server::http(bind).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    let bind_display = bind.to_string();
     let handle = thread::spawn(move || {
         for mut request in server.incoming_requests() {
             let method = request.method().clone();
@@ -149,7 +148,6 @@ pub fn start_api_server(
         }
     });
 
-    eprintln!("Lumen API listening on http://{}", bind_display);
     Ok(handle)
 }
 

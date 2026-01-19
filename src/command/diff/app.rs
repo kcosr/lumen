@@ -21,6 +21,7 @@ use super::git::{
 };
 use super::highlight;
 use super::persistence::{DiffScope, PersistenceManager};
+use super::view_state::ViewStateManager;
 use super::render::{
     render_diff, render_empty_state, truncate_path, FilePickerItem, KeyBind, KeyBindSection, Modal,
     ModalContent, ModalFileStatus, ModalResult,
@@ -265,8 +266,7 @@ fn build_hunk_context(
 
     let context_after: Vec<String> = side_by_side
         .get(
-            change_end
-                .saturating_add(1)
+            change_end.saturating_add(1)
                 ..change_end
                     .saturating_add(1)
                     .saturating_add(3)
@@ -314,8 +314,7 @@ fn compute_hunk_line_range(
     );
     let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
     let hunk_range = *hunks.get(hunk_index)?;
-    let (actual_hunk_start, actual_hunk_end) =
-        hunk_change_bounds(&side_by_side, hunk_range)?;
+    let (actual_hunk_start, actual_hunk_end) = hunk_change_bounds(&side_by_side, hunk_range)?;
 
     let start_line = side_by_side
         .get(actual_hunk_start)
@@ -656,6 +655,7 @@ fn determine_scope(
 
 fn load_persistence_for_state(
     persistence: &mut PersistenceManager,
+    view_state: Option<&mut ViewStateManager>,
     state: &mut AppState,
     options: &DiffOptions,
     backend: &dyn VcsBackend,
@@ -664,7 +664,24 @@ fn load_persistence_for_state(
     if let Err(err) = persistence.load_for_scope(state, &scope) {
         eprintln!("Warning: failed to load annotations: {}", err);
     }
+    if let Some(view_state) = view_state {
+        if let Err(err) = view_state.load_for_scope(state, &scope) {
+            eprintln!("Warning: failed to load view state: {}", err);
+        }
+    }
     Some(scope)
+}
+
+fn save_view_state_for_scope(
+    view_state: Option<&mut ViewStateManager>,
+    state: &AppState,
+    scope: Option<&DiffScope>,
+) {
+    if let (Some(view_state), Some(scope)) = (view_state, scope) {
+        if let Err(err) = view_state.save_for_scope(state, scope) {
+            eprintln!("Warning: failed to save view state: {}", err);
+        }
+    }
 }
 
 pub fn run_app_with_pr(
@@ -786,9 +803,20 @@ fn run_app_internal(
     } else {
         PersistenceManager::try_new()?
     };
+    let mut view_state = if pr_info.is_some() {
+        None
+    } else {
+        ViewStateManager::try_new()?
+    };
     let mut current_scope = None;
     if let Some(ref mut persistence) = persistence {
-        current_scope = load_persistence_for_state(persistence, &mut state, &options, backend);
+        current_scope = load_persistence_for_state(
+            persistence,
+            view_state.as_mut(),
+            &mut state,
+            &options,
+            backend,
+        );
     }
 
     // Load viewed files from GitHub on startup in PR mode
@@ -857,8 +885,7 @@ fn run_app_internal(
                 &diff.new_content,
                 state.settings.tab_width,
             );
-            let hunk_ranges =
-                find_hunk_ranges(&side_by_side, state.settings.unified_context);
+            let hunk_ranges = find_hunk_ranges(&side_by_side, state.settings.unified_context);
             let hunk_count = hunk_ranges.len();
             state
                 .search_state
@@ -1176,6 +1203,7 @@ fn run_app_internal(
                                         if let Some(ref mut persistence) = persistence {
                                             current_scope = load_persistence_for_state(
                                                 persistence,
+                                                view_state.as_mut(),
                                                 &mut state,
                                                 &options,
                                                 backend,
@@ -1195,6 +1223,7 @@ fn run_app_internal(
                                         if let Some(ref mut persistence) = persistence {
                                             current_scope = load_persistence_for_state(
                                                 persistence,
+                                                view_state.as_mut(),
                                                 &mut state,
                                                 &options,
                                                 backend,
@@ -1316,8 +1345,20 @@ fn run_app_internal(
                         {
                             state.search_state.clear();
                         }
-                        KeyCode::Char('q') | KeyCode::Esc => break 'main,
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
+                            break 'main
+                        }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
                             break 'main
                         }
                         KeyCode::Char('1') => {
@@ -1391,6 +1432,7 @@ fn run_app_internal(
                                     if let Some(ref mut persistence) = persistence {
                                         current_scope = load_persistence_for_state(
                                             persistence,
+                                            view_state.as_mut(),
                                             &mut state,
                                             &options,
                                             backend,
@@ -1408,6 +1450,7 @@ fn run_app_internal(
                                     if let Some(ref mut persistence) = persistence {
                                         current_scope = load_persistence_for_state(
                                             persistence,
+                                            view_state.as_mut(),
                                             &mut state,
                                             &options,
                                             backend,
@@ -1568,6 +1611,7 @@ fn run_app_internal(
                             }
                         }
                         KeyCode::Char(' ') => {
+                            let mut should_save_view_state = false;
                             if state.focused_panel == FocusedPanel::Sidebar
                                 && state.sidebar_selected < state.sidebar_visible_len()
                             {
@@ -1588,6 +1632,7 @@ fn run_app_internal(
                                             } else {
                                                 state.viewed_files.insert(file_idx);
                                             }
+                                            should_save_view_state = true;
 
                                             // Fire off async API call if in PR mode
                                             if let Some(ref pr) = pr_info {
@@ -1632,6 +1677,7 @@ fn run_app_internal(
                                                     state.viewed_files.insert(*idx);
                                                 }
                                             }
+                                            should_save_view_state = true;
 
                                             // Fire off async API calls if in PR mode
                                             if let Some(ref pr) = pr_info {
@@ -1699,6 +1745,7 @@ fn run_app_internal(
                                         ensure_sidebar_visible(&mut state, visible_height);
                                     }
                                 }
+                                should_save_view_state = true;
 
                                 // Fire off async API call if in PR mode
                                 if let Some(ref pr) = pr_info {
@@ -1708,6 +1755,13 @@ fn run_app_internal(
                                         mark_file_as_viewed_async(pr, &filename);
                                     }
                                 }
+                            }
+                            if should_save_view_state {
+                                save_view_state_for_scope(
+                                    view_state.as_mut(),
+                                    &state,
+                                    current_scope.as_ref(),
+                                );
                             }
                         }
                         KeyCode::PageDown => {
@@ -1724,10 +1778,8 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_ranges(
-                                    &side_by_side,
-                                    state.settings.unified_context,
-                                );
+                                let hunks =
+                                    find_hunk_ranges(&side_by_side, state.settings.unified_context);
                                 let current_hunk = state.focused_hunk.unwrap_or(0);
                                 let next_hunk = if state.focused_hunk.is_none() {
                                     hunks
@@ -1756,15 +1808,15 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_ranges(
-                                    &side_by_side,
-                                    state.settings.unified_context,
-                                );
+                                let hunks =
+                                    find_hunk_ranges(&side_by_side, state.settings.unified_context);
                                 let current_hunk = state.focused_hunk.unwrap_or(hunks.len());
                                 let prev_hunk = if state.focused_hunk.is_none() {
                                     hunks
                                         .iter()
-                                        .rposition(|h| (h.start as u16) < state.scroll.saturating_sub(5))
+                                        .rposition(|h| {
+                                            (h.start as u16) < state.scroll.saturating_sub(5)
+                                        })
                                         .unwrap_or(hunks.len().saturating_sub(1))
                                 } else {
                                     current_hunk.saturating_sub(1)
@@ -1792,10 +1844,8 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_ranges(
-                                    &side_by_side,
-                                    state.settings.unified_context,
-                                );
+                                let hunks =
+                                    find_hunk_ranges(&side_by_side, state.settings.unified_context);
                                 if let Some(hunk_range) = hunks.get(hunk_index) {
                                     if let Some((actual_hunk_start, actual_hunk_end)) =
                                         hunk_change_bounds(&side_by_side, *hunk_range)
