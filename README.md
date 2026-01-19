@@ -20,6 +20,7 @@ The missing code review tool in the era of AI coding agents.
   - [Configuration (for AI features)](#configuration-for-ai-features)
 - [Usage](#usage-)
   - [Visual Diff Viewer](#visual-diff-viewer)
+  - [Lumen CLI + Skill (Annotations)](#lumen-cli--skill-annotations)
   - [Generate Commit Messages](#generate-commit-messages)
   - [Generate Git Commands](#generate-git-commands)
   - [Explain Changes](#explain-changes)
@@ -138,6 +139,45 @@ lumen diff --watch
 # Stacked mode - review commits one by one
 lumen diff main..feature --stacked
 ```
+
+### Lumen CLI + Skill (Annotations)
+
+This repo includes a `lumen-cli` binary and a skill definition at `skills/lumen-cli/`.
+
+1) Build/install the CLI locally:
+```bash
+cargo build --bin lumen-cli
+# or: cargo install --path . --bin lumen-cli
+```
+
+2) Install the skill locally (copy to your agent skills directory):
+```bash
+cp -R skills/lumen-cli ~/.codex/skills/
+# optional for other agents:
+# cp -R skills/lumen-cli ~/.pi/agent/skills/
+# cp -R skills/lumen-cli ~/.claude/skills/
+```
+
+3) Enable the HTTP API in your lumen config:
+```json
+{
+  "api": {
+    "enabled": true,
+    "bind": "127.0.0.1:7878"
+  }
+}
+```
+Config path: `~/.config/lumen/lumen.config.json`.
+
+4) Start the diff viewer to host the API, then query via the CLI:
+```bash
+lumen diff
+lumen-cli status
+```
+
+Notes:
+- API responses return file paths relative to the server `cwd` (see `lumen-cli status`).
+- Annotations are stored under `.lumen/annotations/` in the repo root.
 
 #### Stacked Diff Mode
 
