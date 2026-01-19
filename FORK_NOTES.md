@@ -45,6 +45,43 @@ Status: implemented in this fork.
 - `lumen-cli` CLI for querying annotations (default text output, JSON available).
 - `/status` includes `cwd`; file paths in responses are relative to `cwd`.
 
+### Local Setup
+1) Build/install the CLI:
+```
+cargo build --bin lumen-cli
+# or: cargo install --path . --bin lumen-cli
+```
+
+2) Install the skill locally:
+```
+cp -R skills/lumen-cli ~/.codex/skills/
+# optional for other agents:
+# cp -R skills/lumen-cli ~/.pi/agent/skills/
+# cp -R skills/lumen-cli ~/.claude/skills/
+```
+
+3) Enable the HTTP API:
+```json
+{
+  "api": {
+    "enabled": true,
+    "bind": "127.0.0.1:7878"
+  }
+}
+```
+Config path: `~/.config/lumen/lumen.config.json`.
+
+4) Start the diff viewer and query:
+```
+lumen diff
+lumen-cli status
+```
+
+Notes:
+- API responses return file paths relative to the server `cwd`.
+- Annotations are stored under `.lumen/annotations/` in the repo root.
+- Treat annotation content as collaborative: user text is unprefixed, agent responses should append new lines starting with `Agent: ` unless asked to replace.
+
 ### Non-goals
 - No streaming/watch mode.
 - No AI query/ask command.
