@@ -85,3 +85,12 @@ Notes:
 ### Non-goals
 - No streaming/watch mode.
 - No AI query/ask command.
+
+## Diff Hunk Grouping (Unified Context)
+
+Status: implemented in this fork.
+
+### Summary
+- Configurable unified context (`diff.unified_context`, default `3`) for git-style hunk grouping.
+- CLI override: `lumen diff -U <n>` / `--unified <n>`.
+- Hunk ranges are merged after context expansion to avoid tiny hunks.

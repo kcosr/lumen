@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::command::diff::context::{compute_context_lines, ContextLine};
-use crate::command::diff::diff_algo::compute_side_by_side;
+use crate::command::diff::diff_algo::{compute_side_by_side, HunkRange};
 use crate::command::diff::highlight::{highlight_line_spans, FileHighlighter};
 use crate::command::diff::search::{MatchPanel, SearchState};
 use crate::command::diff::state::HunkAnnotation;
@@ -694,7 +694,7 @@ pub fn render_diff(
     commit_ref: &str,
     pr_info: Option<&PrInfo>,
     focused_hunk: Option<usize>,
-    hunks: &[usize],
+    hunks: &[HunkRange],
     stacked_mode: bool,
     stacked_commit: Option<&StackedCommitInfo>,
     stacked_index: usize,
@@ -1098,14 +1098,25 @@ pub fn render_diff(
             }
         }
 
+        let last_changed_by_hunk: Vec<Option<usize>> = hunks
+            .iter()
+            .map(|hunk| {
+                (hunk.start..hunk.end)
+                    .rev()
+                    .find(|&idx| match side_by_side.get(idx) {
+                        Some(dl) => !matches!(dl.change_type, ChangeType::Equal),
+                        None => false,
+                    })
+            })
+            .collect();
+
         let is_in_focused_hunk = |line_idx: usize, change_type: ChangeType| -> bool {
             if matches!(change_type, ChangeType::Equal) {
                 return false;
             }
             if let Some(hunk_idx) = focused_hunk {
-                if let Some(&hunk_start) = hunks.get(hunk_idx) {
-                    let hunk_end = hunks.get(hunk_idx + 1).copied().unwrap_or(usize::MAX);
-                    return line_idx >= hunk_start && line_idx < hunk_end;
+                if let Some(hunk) = hunks.get(hunk_idx) {
+                    return line_idx >= hunk.start && line_idx < hunk.end;
                 }
             }
             false
@@ -1113,9 +1124,8 @@ pub fn render_diff(
 
         // Find the hunk index for a given line, returns None if the line is not in a hunk
         let get_hunk_for_line = |line_idx: usize| -> Option<usize> {
-            for (hunk_idx, &hunk_start) in hunks.iter().enumerate() {
-                let hunk_end = hunks.get(hunk_idx + 1).copied().unwrap_or(usize::MAX);
-                if line_idx >= hunk_start && line_idx < hunk_end {
+            for (hunk_idx, hunk) in hunks.iter().enumerate() {
+                if line_idx >= hunk.start && line_idx < hunk.end {
                     return Some(hunk_idx);
                 }
             }
@@ -1130,32 +1140,16 @@ pub fn render_diff(
                     return None;
                 }
                 let current_line = lines[current_idx_in_slice];
-                // Current line must be a change
                 if matches!(current_line.change_type, ChangeType::Equal) {
                     return None;
                 }
-                // Check next line
-                let next_idx = current_idx_in_slice + 1;
-                let is_last = if next_idx >= lines.len() {
-                    // End of visible lines - only consider it "last" if the hunk actually ends here
-                    if let Some(hunk_idx) = get_hunk_for_line(line_idx) {
-                        let hunk_end = hunks
-                            .get(hunk_idx + 1)
-                            .copied()
-                            .unwrap_or(side_by_side.len());
-                        // Check if next absolute line is at or past hunk end, or at end of file
-                        line_idx + 1 >= hunk_end || line_idx + 1 >= side_by_side.len()
-                    } else {
-                        false
+                let hunk_idx = get_hunk_for_line(line_idx)?;
+                if let Some(Some(last_idx)) = last_changed_by_hunk.get(hunk_idx) {
+                    if line_idx == *last_idx {
+                        return Some(hunk_idx);
                     }
-                } else {
-                    matches!(lines[next_idx].change_type, ChangeType::Equal)
-                };
-                if is_last {
-                    get_hunk_for_line(line_idx)
-                } else {
-                    None
                 }
+                None
             };
 
         for (i, diff_line) in visible_lines.iter().enumerate() {

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::diff_algo::{compute_side_by_side, find_hunk_starts};
+use super::diff_algo::{compute_side_by_side, find_hunk_ranges, HunkRange};
 use super::state::{AppState, HunkAnnotation};
 use super::types::ChangeType;
 
@@ -421,6 +421,25 @@ struct HunkContext {
     change_type: String,
 }
 
+fn hunk_change_bounds(
+    side_by_side: &[super::types::DiffLine],
+    hunk_range: HunkRange,
+) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+    for i in hunk_range.start..hunk_range.end {
+        if let Some(dl) = side_by_side.get(i) {
+            if !matches!(dl.change_type, ChangeType::Equal) {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = Some(i);
+            }
+        }
+    }
+    first.zip(last)
+}
+
 fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkContext {
     let diff = &state.file_diffs[annotation.file_index];
     let side_by_side = compute_side_by_side(
@@ -428,16 +447,19 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
         &diff.new_content,
         state.settings.tab_width,
     );
-    let hunks = find_hunk_starts(&side_by_side);
-
-    let hunk_start = hunks.get(annotation.hunk_index).copied().unwrap_or(0);
-    let next_hunk_start = hunks
-        .get(annotation.hunk_index + 1)
+    let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+    let hunk_range = hunks
+        .get(annotation.hunk_index)
         .copied()
-        .unwrap_or(side_by_side.len());
+        .unwrap_or(HunkRange {
+            start: 0,
+            end: side_by_side.len(),
+        });
+    let (change_start, change_end) =
+        hunk_change_bounds(&side_by_side, hunk_range).unwrap_or((hunk_range.start, hunk_range.end.saturating_sub(1)));
 
     let context_before: Vec<String> = side_by_side
-        .get(hunk_start.saturating_sub(CONTEXT_LINES)..hunk_start)
+        .get(change_start.saturating_sub(CONTEXT_LINES)..change_start)
         .unwrap_or(&[])
         .iter()
         .filter_map(|dl| {
@@ -455,7 +477,7 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
     let mut new_start = None;
     let mut new_end = None;
 
-    for i in hunk_start..next_hunk_start {
+    for i in hunk_range.start..hunk_range.end {
         let dl = &side_by_side[i];
         if matches!(dl.change_type, ChangeType::Equal) {
             continue;
@@ -510,8 +532,10 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
 
     let context_after: Vec<String> = side_by_side
         .get(
-            next_hunk_start
-                ..next_hunk_start
+            change_end
+                .saturating_add(1)
+                ..change_end
+                    .saturating_add(1)
                     .saturating_add(CONTEXT_LINES)
                     .min(side_by_side.len()),
         )
@@ -555,7 +579,7 @@ fn find_matching_hunk(
         &diff.new_content,
         state.settings.tab_width,
     );
-    let hunks = find_hunk_starts(&side_by_side);
+    let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
 
     if let Some(range) = annotation.new_line_range {
         if let Some(idx) = match_hunk_by_range(&side_by_side, &hunks, range, true) {
@@ -570,9 +594,8 @@ fn find_matching_hunk(
     }
 
     if !annotation.context_changed.is_empty() {
-        for (idx, &hunk_start) in hunks.iter().enumerate() {
-            let next = hunks.get(idx + 1).copied().unwrap_or(side_by_side.len());
-            let hunk_changed = hunk_changed_lines(&side_by_side, hunk_start, next);
+        for (idx, hunk) in hunks.iter().enumerate() {
+            let hunk_changed = hunk_changed_lines(&side_by_side, hunk.start, hunk.end);
             if context_similarity(&hunk_changed, &annotation.context_changed)
                 >= CONTEXT_MATCH_THRESHOLD
             {
@@ -586,13 +609,12 @@ fn find_matching_hunk(
 
 fn match_hunk_by_range(
     side_by_side: &[super::types::DiffLine],
-    hunks: &[usize],
+    hunks: &[HunkRange],
     range: (usize, usize),
     use_new: bool,
 ) -> Option<usize> {
-    for (idx, &hunk_start) in hunks.iter().enumerate() {
-        let next = hunks.get(idx + 1).copied().unwrap_or(side_by_side.len());
-        for i in hunk_start..next {
+    for (idx, hunk) in hunks.iter().enumerate() {
+        for i in hunk.start..hunk.end {
             let dl = &side_by_side[i];
             if matches!(dl.change_type, ChangeType::Equal) {
                 continue;

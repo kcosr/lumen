@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
-use crate::command::diff::diff_algo::{compute_side_by_side, find_hunk_starts};
+use crate::command::diff::diff_algo::{compute_side_by_side, find_hunk_ranges};
 
 /// Maximum number of diff lines to include inline when exporting annotations.
 /// Hunks with more lines than this will not include the diff content in the export
@@ -150,7 +150,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(file_diffs: Vec<FileDiff>) -> Self {
+    pub fn new(file_diffs: Vec<FileDiff>, settings: DiffViewSettings) -> Self {
         let sidebar_items = build_file_tree(&file_diffs);
         let collapsed_dirs = HashSet::new();
         let sidebar_visible = build_sidebar_visible_indices(&sidebar_items, &collapsed_dirs);
@@ -165,15 +165,14 @@ impl AppState {
                 _ => None,
             })
             .unwrap_or(0);
-        let settings = DiffViewSettings::default();
         let (scroll, focused_hunk) = if !file_diffs.is_empty() && current_file < file_diffs.len() {
             let diff = &file_diffs[current_file];
             let side_by_side =
                 compute_side_by_side(&diff.old_content, &diff.new_content, settings.tab_width);
-            let hunks = find_hunk_starts(&side_by_side);
+            let hunks = find_hunk_ranges(&side_by_side, settings.unified_context);
             let scroll = hunks
                 .first()
-                .map(|&h| (h as u16).saturating_sub(5))
+                .map(|h| (h.start as u16).saturating_sub(5))
                 .unwrap_or(0);
             let focused = if hunks.is_empty() { None } else { Some(0) };
             (scroll, focused)
@@ -424,7 +423,7 @@ impl AppState {
                     &diff.new_content,
                     self.settings.tab_width,
                 );
-                let hunk_count = find_hunk_starts(&side_by_side).len();
+                let hunk_count = find_hunk_ranges(&side_by_side, self.settings.unified_context).len();
                 (diff.filename.as_str(), (idx, hunk_count))
             })
             .collect();
@@ -495,10 +494,10 @@ impl AppState {
             &diff.new_content,
             self.settings.tab_width,
         );
-        let hunks = find_hunk_starts(&side_by_side);
+        let hunks = find_hunk_ranges(&side_by_side, self.settings.unified_context);
         self.scroll = hunks
             .first()
-            .map(|&h| (h as u16).saturating_sub(5))
+            .map(|h| (h.start as u16).saturating_sub(5))
             .unwrap_or(0);
         self.h_scroll = 0;
         self.focused_hunk = if hunks.is_empty() { None } else { Some(0) };
@@ -640,13 +639,11 @@ impl AppState {
             &diff.new_content,
             self.settings.tab_width,
         );
-        let hunks = find_hunk_starts(&side_by_side);
+        let hunks = find_hunk_ranges(&side_by_side, self.settings.unified_context);
 
-        let hunk_start = *hunks.get(hunk_index)?;
-        let next_hunk_start = hunks
-            .get(hunk_index + 1)
-            .copied()
-            .unwrap_or(side_by_side.len());
+        let hunk_range = hunks.get(hunk_index)?;
+        let hunk_start = hunk_range.start;
+        let next_hunk_start = hunk_range.end;
 
         let mut diff_lines = String::new();
         let mut old_start: Option<usize> = None;

@@ -30,6 +30,7 @@ pub struct DiffOptions {
     pub theme: Option<String>,
     pub stacked: bool,
     pub api: crate::config::ApiConfig,
+    pub unified_context: usize,
 }
 
 #[derive(Clone)]

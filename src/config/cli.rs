@@ -131,6 +131,10 @@ pub enum Commands {
         /// Show commits stacked (commit-by-commit navigation with ctrl+l/h)
         #[arg(long)]
         stacked: bool,
+
+        /// Unified context lines (git-style hunk grouping, e.g., -U3)
+        #[arg(short = 'U', long = "unified", value_name = "LINES")]
+        unified: Option<usize>,
     },
     /// Interactively configure Lumen (provider, API key)
     Configure,

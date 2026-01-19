@@ -2,6 +2,12 @@ use similar::{ChangeTag, TextDiff};
 
 use super::types::{expand_tabs, ChangeType, DiffLine, InlineSegment};
 
+#[derive(Clone, Copy, Debug)]
+pub struct HunkRange {
+    pub start: usize,
+    pub end: usize, // end is exclusive
+}
+
 /// Check if a string contains meaningful (non-whitespace) content.
 fn has_meaningful_content(s: &str) -> bool {
     s.chars().any(|c| !c.is_whitespace())
@@ -187,18 +193,57 @@ pub fn compute_side_by_side(old: &str, new: &str, tab_width: usize) -> Vec<DiffL
     lines
 }
 
-pub fn find_hunk_starts(lines: &[DiffLine]) -> Vec<usize> {
-    let mut hunks = Vec::new();
-    let mut in_hunk = false;
+pub fn find_hunk_ranges(lines: &[DiffLine], unified_context: usize) -> Vec<HunkRange> {
+    let mut runs = Vec::new();
+    let mut in_run = false;
+    let mut run_start = 0usize;
 
     for (i, line) in lines.iter().enumerate() {
         let is_change = !matches!(line.change_type, ChangeType::Equal);
-        if is_change && !in_hunk {
-            hunks.push(i);
-            in_hunk = true;
-        } else if !is_change {
-            in_hunk = false;
+        if is_change && !in_run {
+            run_start = i;
+            in_run = true;
+        } else if !is_change && in_run {
+            runs.push(HunkRange {
+                start: run_start,
+                end: i,
+            });
+            in_run = false;
         }
     }
-    hunks
+
+    if in_run {
+        runs.push(HunkRange {
+            start: run_start,
+            end: lines.len(),
+        });
+    }
+
+    if runs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut expanded: Vec<HunkRange> = runs
+        .into_iter()
+        .map(|run| {
+            let start = run.start.saturating_sub(unified_context);
+            let end = (run.end + unified_context).min(lines.len());
+            HunkRange { start, end }
+        })
+        .collect();
+
+    expanded.sort_by_key(|range| range.start);
+
+    let mut merged: Vec<HunkRange> = Vec::new();
+    for range in expanded {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+
+    merged
 }

@@ -32,6 +32,9 @@ pub struct LumenConfig {
 
     #[serde(default)]
     pub api: ApiConfig,
+
+    #[serde(default)]
+    pub diff: DiffConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -49,6 +52,20 @@ pub struct ApiConfig {
     pub enabled: bool,
     #[serde(default = "default_api_bind")]
     pub bind: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffConfig {
+    #[serde(default = "default_unified_context")]
+    pub unified_context: usize,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        DiffConfig {
+            unified_context: default_unified_context(),
+        }
+    }
 }
 
 impl Default for ApiConfig {
@@ -110,6 +127,10 @@ fn default_api_bind() -> String {
     "127.0.0.1:7878".to_string()
 }
 
+fn default_unified_context() -> usize {
+    3
+}
+
 fn deserialize_commit_types<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -155,6 +176,7 @@ impl LumenConfig {
             draft: config.draft,
             theme: config.theme,
             api: config.api,
+            diff: config.diff,
         })
     }
 
@@ -181,6 +203,7 @@ impl Default for LumenConfig {
             draft: default_draft_config(),
             theme: None,
             api: ApiConfig::default(),
+            diff: DiffConfig::default(),
         }
     }
 }

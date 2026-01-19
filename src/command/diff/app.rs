@@ -15,7 +15,7 @@ use ratatui::prelude::*;
 
 use super::annotation::{AnnotationEditor, AnnotationEditorResult};
 use super::api::{start_api_server, ApiCommand, ApiResponse};
-use super::diff_algo::{compute_side_by_side, find_hunk_starts};
+use super::diff_algo::{compute_side_by_side, find_hunk_ranges, HunkRange};
 use super::git::{
     get_current_branch, load_file_diffs, load_pr_file_diffs, load_single_commit_diffs,
 };
@@ -119,7 +119,7 @@ fn status_json(state: &AppState, scope: Option<&DiffScope>) -> Value {
                 &diff.new_content,
                 state.settings.tab_width,
             );
-            find_hunk_starts(&side_by_side).len()
+            find_hunk_ranges(&side_by_side, state.settings.unified_context).len()
         })
         .unwrap_or(0);
 
@@ -146,6 +146,25 @@ fn file_status_str(status: &FileStatus) -> &'static str {
     }
 }
 
+fn hunk_change_bounds(
+    side_by_side: &[super::types::DiffLine],
+    hunk_range: HunkRange,
+) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+    for i in hunk_range.start..hunk_range.end {
+        if let Some(dl) = side_by_side.get(i) {
+            if !matches!(dl.change_type, ChangeType::Equal) {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = Some(i);
+            }
+        }
+    }
+    first.zip(last)
+}
+
 struct HunkContext {
     old_line_range: Option<(usize, usize)>,
     new_line_range: Option<(usize, usize)>,
@@ -167,16 +186,13 @@ fn build_hunk_context(
         &diff.new_content,
         state.settings.tab_width,
     );
-    let hunks = find_hunk_starts(&side_by_side);
+    let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
 
-    let hunk_start = *hunks.get(hunk_index)?;
-    let next_hunk_start = hunks
-        .get(hunk_index + 1)
-        .copied()
-        .unwrap_or(side_by_side.len());
+    let hunk_range = *hunks.get(hunk_index)?;
+    let (change_start, change_end) = hunk_change_bounds(&side_by_side, hunk_range)?;
 
     let context_before: Vec<String> = side_by_side
-        .get(hunk_start.saturating_sub(3)..hunk_start)
+        .get(change_start.saturating_sub(3)..change_start)
         .unwrap_or(&[])
         .iter()
         .filter_map(|dl| {
@@ -194,7 +210,7 @@ fn build_hunk_context(
     let mut new_start = None;
     let mut new_end = None;
 
-    for i in hunk_start..next_hunk_start {
+    for i in hunk_range.start..hunk_range.end {
         let dl = &side_by_side[i];
         if matches!(dl.change_type, ChangeType::Equal) {
             continue;
@@ -248,7 +264,14 @@ fn build_hunk_context(
     }
 
     let context_after: Vec<String> = side_by_side
-        .get(next_hunk_start..next_hunk_start.saturating_add(3).min(side_by_side.len()))
+        .get(
+            change_end
+                .saturating_add(1)
+                ..change_end
+                    .saturating_add(1)
+                    .saturating_add(3)
+                    .min(side_by_side.len()),
+        )
         .unwrap_or(&[])
         .iter()
         .filter_map(|dl| {
@@ -289,24 +312,13 @@ fn compute_hunk_line_range(
         &diff.new_content,
         state.settings.tab_width,
     );
-    let hunks = find_hunk_starts(&side_by_side);
-    let hunk_start = hunks.get(hunk_index).copied().unwrap_or(0);
-    let next_hunk_start = hunks
-        .get(hunk_index + 1)
-        .copied()
-        .unwrap_or(side_by_side.len());
-
-    let mut actual_hunk_end = hunk_start;
-    for i in hunk_start..next_hunk_start {
-        if let Some(dl) = side_by_side.get(i) {
-            if !matches!(dl.change_type, ChangeType::Equal) {
-                actual_hunk_end = i;
-            }
-        }
-    }
+    let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+    let hunk_range = *hunks.get(hunk_index)?;
+    let (actual_hunk_start, actual_hunk_end) =
+        hunk_change_bounds(&side_by_side, hunk_range)?;
 
     let start_line = side_by_side
-        .get(hunk_start)
+        .get(actual_hunk_start)
         .and_then(|dl| {
             dl.new_line
                 .as_ref()
@@ -723,7 +735,11 @@ fn run_app_internal(
         None
     };
 
-    let mut state = AppState::new(file_diffs);
+    let settings = super::types::DiffViewSettings {
+        unified_context: options.unified_context,
+        ..super::types::DiffViewSettings::default()
+    };
+    let mut state = AppState::new(file_diffs, settings);
     state.set_vcs_name(backend.name());
 
     // Set diff reference for annotation export context
@@ -841,8 +857,9 @@ fn run_app_internal(
                 &diff.new_content,
                 state.settings.tab_width,
             );
-            let hunks = find_hunk_starts(&side_by_side);
-            let hunk_count = hunks.len();
+            let hunk_ranges =
+                find_hunk_ranges(&side_by_side, state.settings.unified_context);
+            let hunk_count = hunk_ranges.len();
             state
                 .search_state
                 .update_matches(&side_by_side, state.diff_fullscreen);
@@ -873,7 +890,7 @@ fn run_app_internal(
                     commit_ref,
                     pr_info.as_ref(),
                     state.focused_hunk,
-                    &hunks,
+                    &hunk_ranges,
                     state.stacked_mode,
                     state.current_commit(),
                     state.current_commit_index,
@@ -1022,10 +1039,13 @@ fn run_app_internal(
                                         &diff.new_content,
                                         state.settings.tab_width,
                                     );
-                                    let hunks = find_hunk_starts(&side_by_side);
-                                    if let Some(&hunk_start) = hunks.get(hunk_index) {
+                                    let hunks = find_hunk_ranges(
+                                        &side_by_side,
+                                        state.settings.unified_context,
+                                    );
+                                    if let Some(hunk) = hunks.get(hunk_index) {
                                         state.scroll = adjust_scroll_for_hunk(
-                                            hunk_start,
+                                            hunk.start,
                                             state.scroll,
                                             visible_height,
                                             max_scroll,
@@ -1704,12 +1724,15 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_starts(&side_by_side);
+                                let hunks = find_hunk_ranges(
+                                    &side_by_side,
+                                    state.settings.unified_context,
+                                );
                                 let current_hunk = state.focused_hunk.unwrap_or(0);
                                 let next_hunk = if state.focused_hunk.is_none() {
                                     hunks
                                         .iter()
-                                        .position(|&h| h > state.scroll as usize + 5)
+                                        .position(|h| h.start > state.scroll as usize + 5)
                                         .unwrap_or(0)
                                 } else {
                                     (current_hunk + 1).min(hunks.len().saturating_sub(1))
@@ -1717,7 +1740,7 @@ fn run_app_internal(
                                 if !hunks.is_empty() {
                                     state.focused_hunk = Some(next_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
-                                        hunks[next_hunk],
+                                        hunks[next_hunk].start,
                                         state.scroll,
                                         visible_height,
                                         max_scroll,
@@ -1733,12 +1756,15 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_starts(&side_by_side);
+                                let hunks = find_hunk_ranges(
+                                    &side_by_side,
+                                    state.settings.unified_context,
+                                );
                                 let current_hunk = state.focused_hunk.unwrap_or(hunks.len());
                                 let prev_hunk = if state.focused_hunk.is_none() {
                                     hunks
                                         .iter()
-                                        .rposition(|&h| (h as u16) < state.scroll.saturating_sub(5))
+                                        .rposition(|h| (h.start as u16) < state.scroll.saturating_sub(5))
                                         .unwrap_or(hunks.len().saturating_sub(1))
                                 } else {
                                     current_hunk.saturating_sub(1)
@@ -1746,7 +1772,7 @@ fn run_app_internal(
                                 if !hunks.is_empty() {
                                     state.focused_hunk = Some(prev_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
-                                        hunks[prev_hunk],
+                                        hunks[prev_hunk].start,
                                         state.scroll,
                                         visible_height,
                                         max_scroll,
@@ -1766,63 +1792,56 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_starts(&side_by_side);
-                                let hunk_start = hunks.get(hunk_index).copied().unwrap_or(0);
-                                let next_hunk_start = hunks
-                                    .get(hunk_index + 1)
-                                    .copied()
-                                    .unwrap_or(side_by_side.len());
+                                let hunks = find_hunk_ranges(
+                                    &side_by_side,
+                                    state.settings.unified_context,
+                                );
+                                if let Some(hunk_range) = hunks.get(hunk_index) {
+                                    if let Some((actual_hunk_start, actual_hunk_end)) =
+                                        hunk_change_bounds(&side_by_side, *hunk_range)
+                                    {
+                                        let start_line = side_by_side
+                                            .get(actual_hunk_start)
+                                            .and_then(|dl| {
+                                                dl.new_line
+                                                    .as_ref()
+                                                    .map(|(n, _)| *n)
+                                                    .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                            })
+                                            .unwrap_or(1);
+                                        let end_line = side_by_side
+                                            .get(actual_hunk_end)
+                                            .and_then(|dl| {
+                                                dl.new_line
+                                                    .as_ref()
+                                                    .map(|(n, _)| *n)
+                                                    .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                            })
+                                            .unwrap_or(start_line);
 
-                                // Find the actual end of the hunk (last changed line, not start of next hunk)
-                                let mut actual_hunk_end = hunk_start;
-                                for i in hunk_start..next_hunk_start {
-                                    if let Some(dl) = side_by_side.get(i) {
-                                        if !matches!(dl.change_type, ChangeType::Equal) {
-                                            actual_hunk_end = i;
-                                        }
+                                        let editor = AnnotationEditor::new(
+                                            file_index,
+                                            hunk_index,
+                                            diff.filename.clone(),
+                                            (start_line, end_line),
+                                        );
+
+                                        // If editing existing, pre-fill content
+                                        let editor = if let Some(ann) =
+                                            state.get_annotation(file_index, hunk_index)
+                                        {
+                                            editor.with_content(
+                                                &ann.content,
+                                                ann.created_at,
+                                                ann.id.clone(),
+                                            )
+                                        } else {
+                                            editor
+                                        };
+
+                                        annotation_editor = Some(editor);
                                     }
                                 }
-
-                                let start_line = side_by_side
-                                    .get(hunk_start)
-                                    .and_then(|dl| {
-                                        dl.new_line
-                                            .as_ref()
-                                            .map(|(n, _)| *n)
-                                            .or(dl.old_line.as_ref().map(|(n, _)| *n))
-                                    })
-                                    .unwrap_or(1);
-                                let end_line = side_by_side
-                                    .get(actual_hunk_end)
-                                    .and_then(|dl| {
-                                        dl.new_line
-                                            .as_ref()
-                                            .map(|(n, _)| *n)
-                                            .or(dl.old_line.as_ref().map(|(n, _)| *n))
-                                    })
-                                    .unwrap_or(start_line);
-
-                                let editor = AnnotationEditor::new(
-                                    file_index,
-                                    hunk_index,
-                                    diff.filename.clone(),
-                                    (start_line, end_line),
-                                );
-
-                                // If editing existing, pre-fill content
-                                let editor = if let Some(ann) =
-                                    state.get_annotation(file_index, hunk_index)
-                                {
-                                    editor.with_content(
-                                        &ann.content,
-                                        ann.created_at,
-                                        ann.id.clone(),
-                                    )
-                                } else {
-                                    editor
-                                };
-
-                                annotation_editor = Some(editor);
                             }
                         }
                         KeyCode::Char('I') => {
@@ -1869,14 +1888,19 @@ fn run_app_internal(
                                         &diff.new_content,
                                         state.settings.tab_width,
                                     );
-                                    let hunks = find_hunk_starts(&side_by_side);
-                                    if let Some(&hunk_start) = hunks.get(hunk_idx) {
-                                        side_by_side.get(hunk_start).and_then(|dl| {
-                                            dl.new_line
-                                                .as_ref()
-                                                .map(|(n, _)| *n)
-                                                .or(dl.old_line.as_ref().map(|(n, _)| *n))
-                                        })
+                                    let hunks = find_hunk_ranges(
+                                        &side_by_side,
+                                        state.settings.unified_context,
+                                    );
+                                    if let Some(hunk) = hunks.get(hunk_idx) {
+                                        hunk_change_bounds(&side_by_side, *hunk)
+                                            .and_then(|(start, _)| side_by_side.get(start))
+                                            .and_then(|dl| {
+                                                dl.new_line
+                                                    .as_ref()
+                                                    .map(|(n, _)| *n)
+                                                    .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                            })
                                     } else {
                                         None
                                     }
