@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 use crossterm::{
@@ -13,6 +13,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
+use super::api::{start_api_server, ApiCommand, ApiResponse};
 use super::diff_algo::{compute_side_by_side, find_hunk_starts};
 use super::git::{
     get_current_branch, load_file_diffs, load_pr_file_diffs, load_single_commit_diffs,
@@ -33,6 +34,8 @@ use super::{
 };
 use crate::commit_reference::CommitReference;
 use crate::vcs::{StackedCommitInfo, VcsBackend};
+use serde_json::Value;
+use std::time::UNIX_EPOCH;
 
 /// Navigate to a different commit in stacked mode.
 /// Returns true if navigation was successful.
@@ -83,6 +86,430 @@ fn format_annotation_preview(annotation: &super::state::HunkAnnotation) -> Strin
         preview,
         annotation.format_time()
     )
+}
+
+fn scope_json(scope: Option<&DiffScope>, state: &AppState) -> Value {
+    match scope {
+        Some(DiffScope::WorkingTree { base_commit_id }) => serde_json::json!({
+            "type": "working_tree",
+            "base_commit_id": base_commit_id,
+            "diff_reference": state.diff_reference.clone(),
+            "vcs": state.vcs_name,
+        }),
+        Some(DiffScope::Commit { commit_id }) => serde_json::json!({
+            "type": "commit",
+            "commit_id": commit_id,
+            "diff_reference": state.diff_reference.clone(),
+            "vcs": state.vcs_name,
+        }),
+        None => serde_json::json!({
+            "type": "unknown",
+            "diff_reference": state.diff_reference.clone(),
+            "vcs": state.vcs_name,
+        }),
+    }
+}
+
+fn status_json(state: &AppState, scope: Option<&DiffScope>) -> Value {
+    let diff = state.file_diffs.get(state.current_file);
+    let hunk_count = diff
+        .map(|diff| {
+            let side_by_side =
+                compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+            find_hunk_starts(&side_by_side).len()
+        })
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "scope": scope_json(scope, state),
+        "current_file": diff.map(|d| d.filename.clone()),
+        "current_file_index": state.current_file,
+        "focused_hunk": state.focused_hunk,
+        "hunk_count": hunk_count,
+        "annotations_count": state.annotations.len(),
+    })
+}
+
+fn file_status_str(status: &FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "added",
+        FileStatus::Deleted => "deleted",
+        FileStatus::Modified => "modified",
+    }
+}
+
+struct HunkContext {
+    old_line_range: Option<(usize, usize)>,
+    new_line_range: Option<(usize, usize)>,
+    context_before: Vec<String>,
+    context_changed: Vec<String>,
+    context_after: Vec<String>,
+    diff_text: String,
+    change_type: String,
+}
+
+fn build_hunk_context(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+) -> Option<HunkContext> {
+    let diff = state.file_diffs.get(file_index)?;
+    let side_by_side =
+        compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+    let hunks = find_hunk_starts(&side_by_side);
+
+    let hunk_start = *hunks.get(hunk_index)?;
+    let next_hunk_start = hunks.get(hunk_index + 1).copied().unwrap_or(side_by_side.len());
+
+    let context_before: Vec<String> = side_by_side
+        .get(hunk_start.saturating_sub(3)..hunk_start)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|dl| {
+            dl.new_line
+                .as_ref()
+                .or(dl.old_line.as_ref())
+                .map(|(_, text)| text.clone())
+        })
+        .collect();
+
+    let mut context_changed = Vec::new();
+    let mut diff_text = String::new();
+    let mut old_start = None;
+    let mut old_end = None;
+    let mut new_start = None;
+    let mut new_end = None;
+
+    for i in hunk_start..next_hunk_start {
+        let dl = &side_by_side[i];
+        if matches!(dl.change_type, ChangeType::Equal) {
+            continue;
+        }
+
+        match dl.change_type {
+            ChangeType::Delete => {
+                if let Some((num, text)) = &dl.old_line {
+                    let line = format!("- {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if old_start.is_none() {
+                        old_start = Some(*num);
+                    }
+                    old_end = Some(*num);
+                }
+            }
+            ChangeType::Insert => {
+                if let Some((num, text)) = &dl.new_line {
+                    let line = format!("+ {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if new_start.is_none() {
+                        new_start = Some(*num);
+                    }
+                    new_end = Some(*num);
+                }
+            }
+            ChangeType::Modified => {
+                if let Some((num, text)) = &dl.old_line {
+                    let line = format!("- {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if old_start.is_none() {
+                        old_start = Some(*num);
+                    }
+                    old_end = Some(*num);
+                }
+                if let Some((num, text)) = &dl.new_line {
+                    let line = format!("+ {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if new_start.is_none() {
+                        new_start = Some(*num);
+                    }
+                    new_end = Some(*num);
+                }
+            }
+            ChangeType::Equal => {}
+        }
+    }
+
+    let context_after: Vec<String> = side_by_side
+        .get(next_hunk_start..next_hunk_start.saturating_add(3).min(side_by_side.len()))
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|dl| {
+            dl.new_line
+                .as_ref()
+                .or(dl.old_line.as_ref())
+                .map(|(_, text)| text.clone())
+        })
+        .collect();
+
+    let change_type = if old_start.is_some() && new_start.is_some() {
+        "modification"
+    } else if old_start.is_some() {
+        "deletion"
+    } else {
+        "addition"
+    };
+
+    Some(HunkContext {
+        old_line_range: old_start.zip(old_end),
+        new_line_range: new_start.zip(new_end),
+        context_before,
+        context_changed,
+        context_after,
+        diff_text,
+        change_type: change_type.to_string(),
+    })
+}
+
+fn compute_hunk_line_range(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+) -> Option<(usize, usize)> {
+    let diff = state.file_diffs.get(file_index)?;
+    let side_by_side =
+        compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+    let hunks = find_hunk_starts(&side_by_side);
+    let hunk_start = hunks.get(hunk_index).copied().unwrap_or(0);
+    let next_hunk_start = hunks.get(hunk_index + 1).copied().unwrap_or(side_by_side.len());
+
+    let mut actual_hunk_end = hunk_start;
+    for i in hunk_start..next_hunk_start {
+        if let Some(dl) = side_by_side.get(i) {
+            if !matches!(dl.change_type, ChangeType::Equal) {
+                actual_hunk_end = i;
+            }
+        }
+    }
+
+    let start_line = side_by_side
+        .get(hunk_start)
+        .and_then(|dl| {
+            dl.new_line
+                .as_ref()
+                .map(|(n, _)| *n)
+                .or(dl.old_line.as_ref().map(|(n, _)| *n))
+        })
+        .unwrap_or(1);
+    let end_line = side_by_side
+        .get(actual_hunk_end)
+        .and_then(|dl| {
+            dl.new_line
+                .as_ref()
+                .map(|(n, _)| *n)
+                .or(dl.old_line.as_ref().map(|(n, _)| *n))
+        })
+        .unwrap_or(start_line);
+
+    Some((start_line, end_line))
+}
+
+fn annotation_json(annotation: &super::state::HunkAnnotation) -> Value {
+    let created_at = annotation
+        .created_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    serde_json::json!({
+        "id": annotation.id.clone(),
+        "file": annotation.filename.clone(),
+        "file_index": annotation.file_index,
+        "hunk_index": annotation.hunk_index,
+        "line_range": [annotation.line_range.0, annotation.line_range.1],
+        "content": annotation.content.clone(),
+        "created_at": created_at,
+    })
+}
+
+fn handle_api_command(
+    command: ApiCommand,
+    state: &mut AppState,
+    current_scope: Option<&DiffScope>,
+    persistence: Option<&mut PersistenceManager>,
+) {
+    match command {
+        ApiCommand::Status { respond_to } => {
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: status_json(state, current_scope),
+            });
+        }
+        ApiCommand::CurrentHunk { respond_to } => {
+            let response = if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(context) = build_hunk_context(state, file_index, hunk_index) {
+                    let display_range = context
+                        .new_line_range
+                        .or(context.old_line_range)
+                        .unwrap_or((0, 0));
+                    let annotation = state.get_annotation(file_index, hunk_index);
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [display_range.0, display_range.1],
+                            "old_line_range": context.old_line_range,
+                            "new_line_range": context.new_line_range,
+                            "diff_text": context.diff_text,
+                            "context_before": context.context_before,
+                            "context_changed": context.context_changed,
+                            "context_after": context.context_after,
+                            "change_type": context.change_type,
+                            "annotation": annotation.map(annotation_json),
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::CurrentFile { respond_to } => {
+            let response = if let Some(diff) = state.file_diffs.get(state.current_file) {
+                ApiResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "scope": scope_json(current_scope, state),
+                        "file": diff.filename.clone(),
+                        "file_index": state.current_file,
+                        "status": file_status_str(&diff.status),
+                        "is_binary": diff.is_binary,
+                        "old_content": diff.old_content.clone(),
+                        "new_content": diff.new_content.clone(),
+                    }),
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "file not found" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::FullContext { respond_to } => {
+            let current_hunk = if state.focused_hunk.is_some() {
+                if let Some(hunk_index) = state.focused_hunk {
+                    let file_index = state.current_file;
+                    build_hunk_context(state, file_index, hunk_index).map(|context| {
+                        let display_range = context
+                            .new_line_range
+                            .or(context.old_line_range)
+                            .unwrap_or((0, 0));
+                        serde_json::json!({
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [display_range.0, display_range.1],
+                            "old_line_range": context.old_line_range,
+                            "new_line_range": context.new_line_range,
+                            "diff_text": context.diff_text,
+                            "context_before": context.context_before,
+                            "context_changed": context.context_changed,
+                            "context_after": context.context_after,
+                            "change_type": context.change_type,
+                        })
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let annotations: Vec<Value> = state.annotations.iter().map(annotation_json).collect();
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "status": status_json(state, current_scope),
+                    "current_hunk": current_hunk,
+                    "annotations": annotations,
+                }),
+            });
+        }
+        ApiCommand::Annotations {
+            current_only,
+            respond_to,
+        } => {
+            let annotations: Vec<Value> = state
+                .annotations
+                .iter()
+                .filter(|ann| {
+                    !current_only || ann.file_index == state.current_file
+                })
+                .map(annotation_json)
+                .collect();
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "scope": scope_json(current_scope, state),
+                    "annotations": annotations,
+                }),
+            });
+        }
+        ApiCommand::CreateAnnotation { content, respond_to } => {
+            let response = if content.trim().is_empty() {
+                ApiResponse {
+                    status: 400,
+                    body: serde_json::json!({ "error": "content cannot be empty" }),
+                }
+            } else if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    let annotation = super::state::HunkAnnotation {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        file_index,
+                        hunk_index,
+                        content: content.clone(),
+                        line_range,
+                        filename: state.file_diffs[file_index].filename.clone(),
+                        created_at: std::time::SystemTime::now(),
+                    };
+                    state.set_annotation(annotation.clone());
+                    if let (Some(scope), Some(persistence)) =
+                        (current_scope, persistence)
+                    {
+                        if let Err(err) =
+                            persistence.upsert_annotation(state, &annotation, scope)
+                        {
+                            eprintln!("Warning: failed to persist annotation: {}", err);
+                        }
+                    }
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "annotation": annotation_json(&annotation),
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+    }
 }
 
 fn resolve_working_base_commit(backend: &dyn VcsBackend) -> Option<String> {
@@ -225,6 +652,20 @@ fn run_app_internal(
     let mut annotation_editor: Option<AnnotationEditor> = None;
     let mut pending_watch_event: Option<WatchEvent> = None;
     let mut pending_events: VecDeque<Event> = VecDeque::new();
+    let mut api_rx: Option<mpsc::Receiver<ApiCommand>> = None;
+    let _api_handle = if options.api.enabled {
+        let (tx, rx) = mpsc::channel();
+        api_rx = Some(rx);
+        match start_api_server(&options.api.bind, tx) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                eprintln!("Warning: failed to start API server: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Initialize stacked mode if commits were provided
     if let Some(commits) = stacked_commits {
@@ -247,6 +688,17 @@ fn run_app_internal(
     }
 
     'main: loop {
+        if let Some(ref api_rx) = api_rx {
+            while let Ok(command) = api_rx.try_recv() {
+                handle_api_command(
+                    command,
+                    &mut state,
+                    current_scope.as_ref(),
+                    persistence.as_mut(),
+                );
+            }
+        }
+
         if let Some(ref rx) = watch_rx {
             match rx.try_recv() {
                 Ok(event) => {

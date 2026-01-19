@@ -34,3 +34,16 @@ Status: implemented in this fork.
 ### Non-goals
 - No staged vs unstaged split in the diff viewer.
 - No remote/global annotation storage.
+
+## HTTP API + Client CLI
+
+Status: implemented in this fork.
+
+### Summary
+- Config-driven HTTP API (`api.enabled`, `api.bind`).
+- Endpoints for status, current hunk, current file, annotations, and create annotation.
+- `lumen-query` CLI for querying annotations.
+
+### Non-goals
+- No streaming/watch mode.
+- No AI query/ask command.

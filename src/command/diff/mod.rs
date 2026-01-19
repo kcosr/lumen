@@ -1,4 +1,5 @@
 mod annotation;
+mod api;
 mod app;
 mod context;
 mod diff_algo;
@@ -28,6 +29,7 @@ pub struct DiffOptions {
     pub watch: bool,
     pub theme: Option<String>,
     pub stacked: bool,
+    pub api: crate::config::ApiConfig,
 }
 
 #[derive(Clone)]
