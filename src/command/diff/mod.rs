@@ -10,6 +10,8 @@ mod render;
 mod search;
 mod state;
 mod sticky_lines;
+mod tag_editor;
+mod tags;
 pub mod theme;
 mod types;
 mod view_state;

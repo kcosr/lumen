@@ -69,6 +69,48 @@ fn build_sidebar_visible_indices(
     visible
 }
 
+fn build_sidebar_visible_filtered(
+    items: &[SidebarItem],
+    matching_files: &HashSet<usize>,
+) -> Vec<usize> {
+    let mut dir_indices: HashMap<&str, usize> = HashMap::new();
+    for (idx, item) in items.iter().enumerate() {
+        if let SidebarItem::Directory { path, .. } = item {
+            dir_indices.insert(path.as_str(), idx);
+        }
+    }
+
+    let mut include_indices: HashSet<usize> = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        if let SidebarItem::File {
+            path,
+            file_index,
+            ..
+        } = item
+        {
+            if !matching_files.contains(file_index) {
+                continue;
+            }
+            include_indices.insert(idx);
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() > 1 {
+                for i in 0..parts.len() - 1 {
+                    let dir_path = parts[..=i].join("/");
+                    if let Some(&dir_idx) = dir_indices.get(dir_path.as_str()) {
+                        include_indices.insert(dir_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, _)| include_indices.contains(&idx).then_some(idx))
+        .collect()
+}
+
 /// An annotation attached to a specific hunk in a file.
 ///
 /// Annotations allow users to add notes to code changes during review.
@@ -115,6 +157,21 @@ impl HunkAnnotation {
     }
 }
 
+/// Tags applied to a specific hunk in a file.
+#[derive(Clone)]
+pub struct HunkTags {
+    pub file_index: usize,
+    pub hunk_index: usize,
+    pub filename: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagFilter {
+    Tag(String),
+    Untagged,
+}
+
 pub struct AppState {
     pub file_diffs: Vec<FileDiff>,
     pub sidebar_items: Vec<SidebarItem>,
@@ -137,6 +194,10 @@ pub struct AppState {
     pub focused_hunk: Option<usize>,
     // Annotation fields
     pub annotations: Vec<HunkAnnotation>,
+    // Tag fields
+    pub hunk_tags: Vec<HunkTags>,
+    pub tag_inventory: Vec<String>,
+    pub tag_filter: Option<TagFilter>,
     // Stacked mode fields
     pub stacked_mode: bool,
     pub stacked_commits: Vec<StackedCommitInfo>,
@@ -201,6 +262,9 @@ impl AppState {
             needs_reload: false,
             focused_hunk,
             annotations: Vec::new(),
+            hunk_tags: Vec::new(),
+            tag_inventory: Vec::new(),
+            tag_filter: None,
             stacked_mode: false,
             stacked_commits: Vec::new(),
             current_commit_index: 0,
@@ -263,6 +327,26 @@ impl AppState {
             self.sidebar_selected = self.sidebar_visible.len() - 1;
         }
 
+        if self.sidebar_scroll >= self.sidebar_visible.len() {
+            self.sidebar_scroll = self.sidebar_visible.len() - 1;
+        }
+    }
+
+    pub fn rebuild_sidebar_visible_filtered(&mut self, matching_files: &HashSet<usize>) {
+        self.sidebar_visible =
+            build_sidebar_visible_filtered(&self.sidebar_items, matching_files);
+        if self.sidebar_visible.is_empty() {
+            self.sidebar_selected = 0;
+            self.sidebar_scroll = 0;
+            return;
+        }
+        if let Some(idx) = self
+            .sidebar_visible
+            .iter()
+            .position(|idx| matches!(self.sidebar_items[*idx], SidebarItem::File { .. }))
+        {
+            self.sidebar_selected = idx;
+        }
         if self.sidebar_scroll >= self.sidebar_visible.len() {
             self.sidebar_scroll = self.sidebar_visible.len() - 1;
         }
@@ -446,6 +530,20 @@ impl AppState {
             }
         });
 
+        // Filter and update tags
+        self.hunk_tags.retain_mut(|hunk| {
+            if let Some(&(new_file_index, hunk_count)) = file_info.get(hunk.filename.as_str()) {
+                if hunk.hunk_index < hunk_count {
+                    hunk.file_index = new_file_index;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+
         // Convert viewed filenames back to indices in the new file_diffs
         self.viewed_files = self
             .file_diffs
@@ -526,6 +624,27 @@ impl AppState {
     pub fn remove_annotation(&mut self, file_index: usize, hunk_index: usize) {
         self.annotations
             .retain(|a| !(a.file_index == file_index && a.hunk_index == hunk_index));
+    }
+
+    pub fn get_hunk_tags(&self, file_index: usize, hunk_index: usize) -> Option<&HunkTags> {
+        self.hunk_tags
+            .iter()
+            .find(|t| t.file_index == file_index && t.hunk_index == hunk_index)
+    }
+
+    pub fn set_hunk_tags(&mut self, hunk_tags: HunkTags) {
+        if let Some(existing) = self.hunk_tags.iter_mut().find(|t| {
+            t.file_index == hunk_tags.file_index && t.hunk_index == hunk_tags.hunk_index
+        }) {
+            *existing = hunk_tags;
+        } else {
+            self.hunk_tags.push(hunk_tags);
+        }
+    }
+
+    pub fn remove_hunk_tags(&mut self, file_index: usize, hunk_index: usize) {
+        self.hunk_tags
+            .retain(|t| !(t.file_index == file_index && t.hunk_index == hunk_index));
     }
 
     /// Format all annotations for export with full diff context

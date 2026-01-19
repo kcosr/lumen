@@ -114,3 +114,21 @@ TEST unified block line 2.
 .lumen/state/working-tree.json
 .lumen/state/<sha>.json
 ```
+
+## Hunk Tags
+
+### Summary
+- Tag hunks with `t` (modal lets you pick existing tags or type new ones).
+- Tags are per-scope; tag inventory is repo-level.
+- Filter hunks/files by tag with `T` (cycles tag → tag → untagged → all).
+
+### Storage Layout
+```
+.lumen/tags/index.json
+.lumen/tags/working-tree.json
+.lumen/tags/<sha>.json
+```
+
+### UI Notes
+- Footer shows the active tag filter and tags for the focused hunk.
+- Sidebar list filters to files with matching hunks while a filter is active.

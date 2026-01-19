@@ -695,6 +695,9 @@ pub fn render_diff(
     pr_info: Option<&PrInfo>,
     focused_hunk: Option<usize>,
     hunks: &[HunkRange],
+    footer_focused_hunk: Option<usize>,
+    tag_filter_label: Option<String>,
+    focused_tags: Option<String>,
     stacked_mode: bool,
     stacked_commit: Option<&StackedCommitInfo>,
     stacked_index: usize,
@@ -801,6 +804,8 @@ pub fn render_diff(
                 focused_hunk: None,
                 search_state,
                 area_width: area.width,
+                tag_filter_label: tag_filter_label.clone(),
+                focused_tags: focused_tags.clone(),
             },
         );
         return;
@@ -1400,9 +1405,11 @@ pub fn render_diff(
             line_stats_added: line_stats.added,
             line_stats_removed: line_stats.removed,
             hunk_count,
-            focused_hunk,
+            focused_hunk: footer_focused_hunk,
             search_state,
             area_width: area.width,
+            tag_filter_label,
+            focused_tags,
         },
     );
 }

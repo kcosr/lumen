@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
@@ -21,12 +21,16 @@ use super::git::{
 };
 use super::highlight;
 use super::persistence::{DiffScope, PersistenceManager};
+use super::tag_editor::{TagEditor, TagEditorResult};
+use super::tags::TagManager;
 use super::view_state::ViewStateManager;
 use super::render::{
     render_diff, render_empty_state, truncate_path, FilePickerItem, KeyBind, KeyBindSection, Modal,
     ModalContent, ModalFileStatus, ModalResult,
 };
-use super::state::{adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey};
+use super::state::{
+    adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey, TagFilter,
+};
 use super::theme;
 use super::types::{ChangeType, DiffFullscreen, FileStatus, FocusedPanel, SidebarItem};
 use super::watcher::{setup_watcher, WatchEvent};
@@ -336,6 +340,112 @@ fn compute_hunk_line_range(
         .unwrap_or(start_line);
 
     Some((start_line, end_line))
+}
+
+fn hunk_matches_filter(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    filter: Option<&TagFilter>,
+) -> bool {
+    match filter {
+        None => true,
+        Some(TagFilter::Tag(tag)) => state
+            .get_hunk_tags(file_index, hunk_index)
+            .map(|tags| tags.tags.iter().any(|t| t == tag))
+            .unwrap_or(false),
+        Some(TagFilter::Untagged) => state
+            .get_hunk_tags(file_index, hunk_index)
+            .map(|tags| tags.tags.is_empty())
+            .unwrap_or(true),
+    }
+}
+
+fn matching_hunk_indices(
+    state: &AppState,
+    file_index: usize,
+    hunks: &[HunkRange],
+    filter: Option<&TagFilter>,
+) -> Vec<usize> {
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| hunk_matches_filter(state, file_index, *idx, filter))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn matching_files_for_filter(state: &AppState, filter: &TagFilter) -> HashSet<usize> {
+    match filter {
+        TagFilter::Tag(tag) => state
+            .hunk_tags
+            .iter()
+            .filter(|hunk| hunk.tags.iter().any(|t| t == tag))
+            .map(|hunk| hunk.file_index)
+            .collect(),
+        TagFilter::Untagged => {
+            let mut files = HashSet::new();
+            for (idx, diff) in state.file_diffs.iter().enumerate() {
+                let side_by_side = compute_side_by_side(
+                    &diff.old_content,
+                    &diff.new_content,
+                    state.settings.tab_width,
+                );
+                let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+                for hunk_idx in 0..hunks.len() {
+                    if hunk_matches_filter(state, idx, hunk_idx, Some(filter)) {
+                        files.insert(idx);
+                        break;
+                    }
+                }
+            }
+            files
+        }
+    }
+}
+
+fn apply_tag_filter(state: &mut AppState) {
+    if let Some(filter) = state.tag_filter.as_ref() {
+        let matching_files = matching_files_for_filter(state, filter);
+        state.rebuild_sidebar_visible_filtered(&matching_files);
+        if matching_files.contains(&state.current_file) {
+            return;
+        }
+        if let Some(file_index) = state.sidebar_visible.iter().find_map(|idx| {
+            if let SidebarItem::File { file_index, .. } = state.sidebar_items[*idx] {
+                Some(file_index)
+            } else {
+                None
+            }
+        }) {
+            state.select_file(file_index);
+        } else {
+            state.current_file = 0;
+            state.focused_hunk = None;
+        }
+    } else {
+        state.rebuild_sidebar_visible();
+    }
+}
+
+fn next_tag_filter(current: Option<&TagFilter>, tags: &[String]) -> Option<TagFilter> {
+    let mut sequence: Vec<TagFilter> = tags.iter().map(|t| TagFilter::Tag(t.clone())).collect();
+    sequence.push(TagFilter::Untagged);
+
+    match current {
+        None => sequence.first().cloned(),
+        Some(current_filter) => {
+            if let Some(pos) = sequence.iter().position(|f| f == current_filter) {
+                if pos + 1 < sequence.len() {
+                    Some(sequence[pos + 1].clone())
+                } else {
+                    None
+                }
+            } else {
+                sequence.first().cloned()
+            }
+        }
+    }
 }
 
 fn annotation_json(annotation: &super::state::HunkAnnotation) -> Value {
@@ -656,6 +766,7 @@ fn determine_scope(
 fn load_persistence_for_state(
     persistence: &mut PersistenceManager,
     view_state: Option<&mut ViewStateManager>,
+    tag_manager: Option<&mut TagManager>,
     state: &mut AppState,
     options: &DiffOptions,
     backend: &dyn VcsBackend,
@@ -667,6 +778,11 @@ fn load_persistence_for_state(
     if let Some(view_state) = view_state {
         if let Err(err) = view_state.load_for_scope(state, &scope) {
             eprintln!("Warning: failed to load view state: {}", err);
+        }
+    }
+    if let Some(tag_manager) = tag_manager {
+        if let Err(err) = tag_manager.load_for_scope(state, &scope) {
+            eprintln!("Warning: failed to load tags: {}", err);
         }
     }
     Some(scope)
@@ -776,6 +892,7 @@ fn run_app_internal(
 
     let mut active_modal: Option<Modal> = None;
     let mut annotation_editor: Option<AnnotationEditor> = None;
+    let mut tag_editor: Option<TagEditor> = None;
     let mut pending_watch_event: Option<WatchEvent> = None;
     let mut pending_events: VecDeque<Event> = VecDeque::new();
     let mut api_rx: Option<mpsc::Receiver<ApiCommand>> = None;
@@ -803,6 +920,7 @@ fn run_app_internal(
     } else {
         PersistenceManager::try_new()?
     };
+    let mut tag_manager = TagManager::try_new()?;
     let mut view_state = if pr_info.is_some() {
         None
     } else {
@@ -813,10 +931,18 @@ fn run_app_internal(
         current_scope = load_persistence_for_state(
             persistence,
             view_state.as_mut(),
+            tag_manager.as_mut(),
             &mut state,
             &options,
             backend,
         );
+    } else if let Some(ref mut tag_manager) = tag_manager {
+        current_scope = determine_scope(&state, &options, backend);
+        if let Some(ref scope) = current_scope {
+            if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
+                eprintln!("Warning: failed to load tags: {}", err);
+            }
+        }
     }
 
     // Load viewed files from GitHub on startup in PR mode
@@ -869,9 +995,16 @@ fn run_app_internal(
             if let Some(ref pr) = pr_info {
                 sync_viewed_files_from_github(pr, &mut state);
             }
+            apply_tag_filter(&mut state);
         }
 
-        if state.file_diffs.is_empty() {
+        let has_visible_files = if state.tag_filter.is_some() {
+            !state.sidebar_visible.is_empty()
+        } else {
+            !state.file_diffs.is_empty()
+        };
+
+        if !has_visible_files {
             terminal.draw(|frame| {
                 render_empty_state(frame, options.watch);
                 if let Some(ref modal) = active_modal {
@@ -886,7 +1019,30 @@ fn run_app_internal(
                 state.settings.tab_width,
             );
             let hunk_ranges = find_hunk_ranges(&side_by_side, state.settings.unified_context);
-            let hunk_count = hunk_ranges.len();
+            let matching_hunks = matching_hunk_indices(
+                &state,
+                state.current_file,
+                &hunk_ranges,
+                state.tag_filter.as_ref(),
+            );
+            let hunk_count = matching_hunks.len();
+            let footer_focused_hunk = state
+                .focused_hunk
+                .and_then(|idx| matching_hunks.iter().position(|hunk| *hunk == idx));
+            let tag_filter_label = state.tag_filter.as_ref().map(|filter| match filter {
+                TagFilter::Tag(tag) => format!("tag: {}", tag),
+                TagFilter::Untagged => "tag: untagged".to_string(),
+            });
+            let focused_tags = state
+                .focused_hunk
+                .and_then(|idx| state.get_hunk_tags(state.current_file, idx))
+                .and_then(|tags| {
+                    if tags.tags.is_empty() {
+                        None
+                    } else {
+                        Some(tags.tags.join(", "))
+                    }
+                });
             state
                 .search_state
                 .update_matches(&side_by_side, state.diff_fullscreen);
@@ -918,6 +1074,9 @@ fn run_app_internal(
                     pr_info.as_ref(),
                     state.focused_hunk,
                     &hunk_ranges,
+                    footer_focused_hunk,
+                    tag_filter_label,
+                    focused_tags,
                     state.stacked_mode,
                     state.current_commit(),
                     state.current_commit_index,
@@ -927,6 +1086,9 @@ fn run_app_internal(
                 );
                 // Render annotation editor (on top of everything except modal)
                 if let Some(ref editor) = annotation_editor {
+                    editor.render(frame);
+                }
+                if let Some(ref editor) = tag_editor {
                     editor.render(frame);
                 }
                 if let Some(ref modal) = active_modal {
@@ -987,6 +1149,55 @@ fn run_app_internal(
                 }
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
+                        && tag_editor.is_some()
+                        && active_modal.is_none() =>
+                {
+                    if let Some(editor) = tag_editor.as_mut() {
+                        match editor.handle_input(key) {
+                            TagEditorResult::Continue => {}
+                            TagEditorResult::Save(tags) => {
+                                let file_index = editor.file_index;
+                                let hunk_index = editor.hunk_index;
+                                if let Some(diff) = state.file_diffs.get(file_index) {
+                                    if tags.is_empty() {
+                                        state.remove_hunk_tags(file_index, hunk_index);
+                                    } else {
+                                        state.set_hunk_tags(super::state::HunkTags {
+                                            file_index,
+                                            hunk_index,
+                                            filename: diff.filename.clone(),
+                                            tags: tags.clone(),
+                                        });
+                                    }
+                                    if let (Some(ref mut tag_manager), Some(scope)) =
+                                        (tag_manager.as_mut(), current_scope.as_ref())
+                                    {
+                                        if let Err(err) = tag_manager.set_hunk_tags(
+                                            &state,
+                                            file_index,
+                                            hunk_index,
+                                            tags,
+                                            scope,
+                                        ) {
+                                            eprintln!(
+                                                "Warning: failed to persist tags: {}",
+                                                err
+                                            );
+                                        }
+                                        state.tag_inventory = tag_manager.tags().to_vec();
+                                    }
+                                }
+                                apply_tag_filter(&mut state);
+                                tag_editor = None;
+                            }
+                            TagEditorResult::Cancel => {
+                                tag_editor = None;
+                            }
+                        }
+                    }
+                }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
                         && annotation_editor.is_some()
                         && active_modal.is_none() =>
                 {
@@ -1042,6 +1253,9 @@ fn run_app_internal(
                                 ModalResult::FileSelected(file_index) => {
                                     state.reveal_file(file_index);
                                     state.select_file(file_index);
+                                    if state.tag_filter.is_some() {
+                                        apply_tag_filter(&mut state);
+                                    }
                                     if let Some(idx) =
                                         state.sidebar_visible_index_for_file(state.current_file)
                                     {
@@ -1204,10 +1418,12 @@ fn run_app_internal(
                                             current_scope = load_persistence_for_state(
                                                 persistence,
                                                 view_state.as_mut(),
+                                                tag_manager.as_mut(),
                                                 &mut state,
                                                 &options,
                                                 backend,
                                             );
+                                            apply_tag_filter(&mut state);
                                         }
                                     }
                                 }
@@ -1224,10 +1440,12 @@ fn run_app_internal(
                                             current_scope = load_persistence_for_state(
                                                 persistence,
                                                 view_state.as_mut(),
+                                                tag_manager.as_mut(),
                                                 &mut state,
                                                 &options,
                                                 backend,
                                             );
+                                            apply_tag_filter(&mut state);
                                         }
                                     }
                                 }
@@ -1433,10 +1651,12 @@ fn run_app_internal(
                                         current_scope = load_persistence_for_state(
                                             persistence,
                                             view_state.as_mut(),
+                                            tag_manager.as_mut(),
                                             &mut state,
                                             &options,
                                             backend,
                                         );
+                                        apply_tag_filter(&mut state);
                                     }
                                 }
                             }
@@ -1451,10 +1671,12 @@ fn run_app_internal(
                                         current_scope = load_persistence_for_state(
                                             persistence,
                                             view_state.as_mut(),
+                                            tag_manager.as_mut(),
                                             &mut state,
                                             &options,
                                             backend,
                                         );
+                                        apply_tag_filter(&mut state);
                                     }
                                 }
                             }
@@ -1593,6 +1815,12 @@ fn run_app_internal(
                                         }
                                         SidebarItem::Directory { path, .. } => {
                                             state.toggle_directory(&path);
+                                            if state.tag_filter.is_some() {
+                                                apply_tag_filter(&mut state);
+                                            }
+                                            if state.tag_filter.is_some() {
+                                                apply_tag_filter(&mut state);
+                                            }
                                             let visible_height =
                                                 terminal.size()?.height.saturating_sub(5) as usize;
                                             if state.sidebar_selected < state.sidebar_scroll {
@@ -1780,16 +2008,31 @@ fn run_app_internal(
                                 );
                                 let hunks =
                                     find_hunk_ranges(&side_by_side, state.settings.unified_context);
-                                let current_hunk = state.focused_hunk.unwrap_or(0);
-                                let next_hunk = if state.focused_hunk.is_none() {
-                                    hunks
-                                        .iter()
-                                        .position(|h| h.start > state.scroll as usize + 5)
-                                        .unwrap_or(0)
-                                } else {
-                                    (current_hunk + 1).min(hunks.len().saturating_sub(1))
-                                };
-                                if !hunks.is_empty() {
+                                let matching = matching_hunk_indices(
+                                    &state,
+                                    state.current_file,
+                                    &hunks,
+                                    state.tag_filter.as_ref(),
+                                );
+                                if !matching.is_empty() {
+                                    let current_pos = state.focused_hunk.and_then(|idx| {
+                                        matching.iter().position(|hunk| *hunk == idx)
+                                    });
+                                    let next_hunk = if let Some(pos) = current_pos {
+                                        if pos + 1 < matching.len() {
+                                            matching[pos + 1]
+                                        } else {
+                                            matching[pos]
+                                        }
+                                    } else {
+                                        matching
+                                            .iter()
+                                            .copied()
+                                            .find(|idx| {
+                                                hunks[*idx].start > state.scroll as usize + 5
+                                            })
+                                            .unwrap_or(matching[0])
+                                    };
                                     state.focused_hunk = Some(next_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
                                         hunks[next_hunk].start,
@@ -1797,6 +2040,8 @@ fn run_app_internal(
                                         visible_height,
                                         max_scroll,
                                     );
+                                } else {
+                                    state.focused_hunk = None;
                                 }
                             }
                         }
@@ -1810,18 +2055,32 @@ fn run_app_internal(
                                 );
                                 let hunks =
                                     find_hunk_ranges(&side_by_side, state.settings.unified_context);
-                                let current_hunk = state.focused_hunk.unwrap_or(hunks.len());
-                                let prev_hunk = if state.focused_hunk.is_none() {
-                                    hunks
-                                        .iter()
-                                        .rposition(|h| {
-                                            (h.start as u16) < state.scroll.saturating_sub(5)
-                                        })
-                                        .unwrap_or(hunks.len().saturating_sub(1))
-                                } else {
-                                    current_hunk.saturating_sub(1)
-                                };
-                                if !hunks.is_empty() {
+                                let matching = matching_hunk_indices(
+                                    &state,
+                                    state.current_file,
+                                    &hunks,
+                                    state.tag_filter.as_ref(),
+                                );
+                                if !matching.is_empty() {
+                                    let current_pos = state.focused_hunk.and_then(|idx| {
+                                        matching.iter().position(|hunk| *hunk == idx)
+                                    });
+                                    let prev_hunk = if let Some(pos) = current_pos {
+                                        if pos > 0 {
+                                            matching[pos - 1]
+                                        } else {
+                                            matching[pos]
+                                        }
+                                    } else {
+                                        matching
+                                            .iter()
+                                            .copied()
+                                            .rfind(|idx| {
+                                                (hunks[*idx].start as u16)
+                                                    < state.scroll.saturating_sub(5)
+                                            })
+                                            .unwrap_or(matching[matching.len() - 1])
+                                    };
                                     state.focused_hunk = Some(prev_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
                                         hunks[prev_hunk].start,
@@ -1829,6 +2088,8 @@ fn run_app_internal(
                                         visible_height,
                                         max_scroll,
                                     );
+                                } else {
+                                    state.focused_hunk = None;
                                 }
                             }
                         }
@@ -1894,6 +2155,32 @@ fn run_app_internal(
                                 }
                             }
                         }
+                        KeyCode::Char('t') => {
+                            if tag_editor.is_none() {
+                                if let Some(hunk_index) = state.focused_hunk {
+                                    let file_index = state.current_file;
+                                    if let Some(line_range) =
+                                        compute_hunk_line_range(&state, file_index, hunk_index)
+                                    {
+                                        if let Some(diff) = state.file_diffs.get(file_index) {
+                                            let existing_tags = state
+                                                .get_hunk_tags(file_index, hunk_index)
+                                                .map(|tags| tags.tags.clone())
+                                                .unwrap_or_default();
+                                            let editor = TagEditor::new(
+                                                file_index,
+                                                hunk_index,
+                                                diff.filename.clone(),
+                                                line_range,
+                                                existing_tags,
+                                                state.tag_inventory.clone(),
+                                            );
+                                            tag_editor = Some(editor);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         KeyCode::Char('I') => {
                             // Open annotations menu
                             if !state.annotations.is_empty() {
@@ -1908,6 +2195,38 @@ fn run_app_internal(
                                     items,
                                     sorted_annotations,
                                 ));
+                            }
+                        }
+                        KeyCode::Char('T') => {
+                            let next_filter =
+                                next_tag_filter(state.tag_filter.as_ref(), &state.tag_inventory);
+                            state.tag_filter = next_filter;
+                            apply_tag_filter(&mut state);
+                            if let Some(filter) = state.tag_filter.as_ref() {
+                                if let Some(diff) = state.file_diffs.get(state.current_file) {
+                                    let side_by_side = compute_side_by_side(
+                                        &diff.old_content,
+                                        &diff.new_content,
+                                        state.settings.tab_width,
+                                    );
+                                    let hunks = find_hunk_ranges(
+                                        &side_by_side,
+                                        state.settings.unified_context,
+                                    );
+                                    let matching =
+                                        matching_hunk_indices(&state, state.current_file, &hunks, Some(filter));
+                                    if let Some(first) = matching.first().copied() {
+                                        state.focused_hunk = Some(first);
+                                        state.scroll = adjust_scroll_for_hunk(
+                                            hunks[first].start,
+                                            state.scroll,
+                                            visible_height,
+                                            max_scroll,
+                                        );
+                                    } else {
+                                        state.focused_hunk = None;
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('r') => {
@@ -2177,6 +2496,19 @@ fn run_app_internal(
                                             KeyBind {
                                                 key: "I",
                                                 description: "View all annotations",
+                                            },
+                                        ],
+                                    },
+                                    KeyBindSection {
+                                        title: "Tags",
+                                        bindings: vec![
+                                            KeyBind {
+                                                key: "t",
+                                                description: "Tag focused hunk",
+                                            },
+                                            KeyBind {
+                                                key: "T",
+                                                description: "Cycle tag filter",
                                             },
                                         ],
                                     },
