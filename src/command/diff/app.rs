@@ -23,6 +23,7 @@ use super::render::{
     ModalContent, ModalFileStatus, ModalResult,
 };
 use super::annotation::{AnnotationEditor, AnnotationEditorResult};
+use super::persistence::{DiffScope, PersistenceManager};
 use super::state::{adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey};
 use super::theme;
 use super::types::{ChangeType, DiffFullscreen, FileStatus, FocusedPanel, SidebarItem};
@@ -82,6 +83,59 @@ fn format_annotation_preview(annotation: &super::state::HunkAnnotation) -> Strin
         preview,
         annotation.format_time()
     )
+}
+
+fn resolve_working_base_commit(backend: &dyn VcsBackend) -> Option<String> {
+    let base_ref = backend.working_copy_parent_ref();
+    backend.resolve_ref(base_ref).ok()
+}
+
+fn resolve_commit_id_from_options(
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> Option<String> {
+    match &options.reference {
+        Some(CommitReference::Single(reference)) => backend.resolve_ref(reference).ok(),
+        Some(CommitReference::Range { to, .. }) => backend.resolve_ref(to).ok(),
+        Some(CommitReference::TripleDots { to, .. }) => backend.resolve_ref(to).ok(),
+        None => None,
+    }
+}
+
+fn determine_scope(
+    state: &AppState,
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> Option<DiffScope> {
+    if state.stacked_mode {
+        if let Some(commit) = state.current_commit() {
+            return Some(DiffScope::Commit {
+                commit_id: commit.commit_id.clone(),
+            });
+        }
+        return None;
+    }
+
+    if let Some(commit_id) = resolve_commit_id_from_options(options, backend) {
+        return Some(DiffScope::Commit { commit_id });
+    }
+
+    resolve_working_base_commit(backend).map(|base_commit_id| DiffScope::WorkingTree {
+        base_commit_id,
+    })
+}
+
+fn load_persistence_for_state(
+    persistence: &mut PersistenceManager,
+    state: &mut AppState,
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> Option<DiffScope> {
+    let scope = determine_scope(state, options, backend)?;
+    if let Err(err) = persistence.load_for_scope(state, &scope) {
+        eprintln!("Warning: failed to load annotations: {}", err);
+    }
+    Some(scope)
 }
 
 pub fn run_app_with_pr(
@@ -175,6 +229,16 @@ fn run_app_internal(
     // Initialize stacked mode if commits were provided
     if let Some(commits) = stacked_commits {
         state.init_stacked_mode(commits);
+    }
+
+    let mut persistence = if pr_info.is_some() {
+        None
+    } else {
+        PersistenceManager::try_new()?
+    };
+    let mut current_scope = None;
+    if let Some(ref mut persistence) = persistence {
+        current_scope = load_persistence_for_state(persistence, &mut state, &options, backend);
     }
 
     // Load viewed files from GitHub on startup in PR mode
@@ -344,11 +408,37 @@ fn run_app_internal(
                         match editor.handle_input(key) {
                             AnnotationEditorResult::Continue => {}
                             AnnotationEditorResult::Save => {
-                                state.set_annotation(editor.to_annotation());
+                                let annotation = editor.to_annotation();
+                                state.set_annotation(annotation.clone());
+                                if let (Some(ref mut persistence), Some(scope)) =
+                                    (persistence.as_mut(), current_scope.as_ref())
+                                {
+                                    if let Err(err) =
+                                        persistence.upsert_annotation(&state, &annotation, scope)
+                                    {
+                                        eprintln!("Warning: failed to save annotation: {}", err);
+                                    }
+                                }
                                 annotation_editor = None;
                             }
                             AnnotationEditorResult::Delete => {
-                                state.remove_annotation(editor.file_index, editor.hunk_index);
+                                if let Some(existing) =
+                                    state.get_annotation(editor.file_index, editor.hunk_index).cloned()
+                                {
+                                    state.remove_annotation(editor.file_index, editor.hunk_index);
+                                    if let (Some(ref mut persistence), Some(scope)) =
+                                        (persistence.as_mut(), current_scope.as_ref())
+                                    {
+                                        if let Err(err) =
+                                            persistence.remove_annotation(&existing, scope)
+                                        {
+                                            eprintln!(
+                                                "Warning: failed to remove annotation: {}",
+                                                err
+                                            );
+                                        }
+                                    }
+                                }
                                 annotation_editor = None;
                             }
                             AnnotationEditorResult::Cancel => {
@@ -405,7 +495,8 @@ fn run_app_internal(
                                             hunk_index,
                                             ann.filename.clone(),
                                             ann.line_range,
-                                        ).with_content(&ann.content, ann.created_at);
+                                        )
+                                        .with_content(&ann.content, ann.created_at, ann.id.clone());
                                         annotation_editor = Some(editor);
                                         // Also jump to the hunk
                                         state.select_file(file_index);
@@ -414,7 +505,23 @@ fn run_app_internal(
                                     active_modal = None;
                                 }
                                 ModalResult::AnnotationDelete { file_index, hunk_index } => {
-                                    state.remove_annotation(file_index, hunk_index);
+                                    if let Some(existing) =
+                                        state.get_annotation(file_index, hunk_index).cloned()
+                                    {
+                                        state.remove_annotation(file_index, hunk_index);
+                                        if let (Some(ref mut persistence), Some(scope)) =
+                                            (persistence.as_mut(), current_scope.as_ref())
+                                        {
+                                            if let Err(err) =
+                                                persistence.remove_annotation(&existing, scope)
+                                            {
+                                                eprintln!(
+                                                    "Warning: failed to remove annotation: {}",
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    }
                                     // Refresh the modal if there are still annotations
                                     if !state.annotations.is_empty() {
                                         let mut sorted_annotations = state.annotations.clone();
@@ -480,7 +587,16 @@ fn run_app_internal(
                                 // Left arrow click (first 4 columns to cover " < ")
                                 if mouse.column < 4 && state.current_commit_index > 0 {
                                     let new_index = state.current_commit_index - 1;
-                                    navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                    if navigate_stacked_commit(&mut state, new_index, &options, backend) {
+                                        if let Some(ref mut persistence) = persistence {
+                                            current_scope = load_persistence_for_state(
+                                                persistence,
+                                                &mut state,
+                                                &options,
+                                                backend,
+                                            );
+                                        }
+                                    }
                                 }
                                 // Right arrow click (last 4 columns to cover " > ")
                                 else if mouse.column >= term_size.width.saturating_sub(4)
@@ -488,7 +604,16 @@ fn run_app_internal(
                                         < state.stacked_commits.len().saturating_sub(1)
                                 {
                                     let new_index = state.current_commit_index + 1;
-                                    navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                    if navigate_stacked_commit(&mut state, new_index, &options, backend) {
+                                        if let Some(ref mut persistence) = persistence {
+                                            current_scope = load_persistence_for_state(
+                                                persistence,
+                                                &mut state,
+                                                &options,
+                                                backend,
+                                            );
+                                        }
+                                    }
                                 }
                             } else if state.show_sidebar
                                 && mouse.column < sidebar_width
@@ -674,14 +799,32 @@ fn run_app_internal(
                                 && state.current_commit_index < state.stacked_commits.len() - 1
                             {
                                 let new_index = state.current_commit_index + 1;
-                                navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                if navigate_stacked_commit(&mut state, new_index, &options, backend) {
+                                    if let Some(ref mut persistence) = persistence {
+                                        current_scope = load_persistence_for_state(
+                                            persistence,
+                                            &mut state,
+                                            &options,
+                                            backend,
+                                        );
+                                    }
+                                }
                             }
                         }
                         // Stacked mode: navigate to previous commit
                         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if state.stacked_mode && state.current_commit_index > 0 {
                                 let new_index = state.current_commit_index - 1;
-                                navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                if navigate_stacked_commit(&mut state, new_index, &options, backend) {
+                                    if let Some(ref mut persistence) = persistence {
+                                        current_scope = load_persistence_for_state(
+                                            persistence,
+                                            &mut state,
+                                            &options,
+                                            backend,
+                                        );
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1099,7 +1242,7 @@ fn run_app_internal(
 
                                 // If editing existing, pre-fill content
                                 let editor = if let Some(ann) = state.get_annotation(file_index, hunk_index) {
-                                    editor.with_content(&ann.content, ann.created_at)
+                                    editor.with_content(&ann.content, ann.created_at, ann.id.clone())
                                 } else {
                                     editor
                                 };

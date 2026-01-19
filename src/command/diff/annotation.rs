@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use tui_textarea::TextArea;
+use uuid::Uuid;
 
 use super::state::HunkAnnotation;
 use super::theme;
@@ -32,6 +33,8 @@ pub struct AnnotationEditor<'a> {
     is_edit: bool,
     /// Original creation time (preserved when editing)
     original_created_at: Option<SystemTime>,
+    /// Preserve persistent annotation ID when editing
+    annotation_id: Option<String>,
 }
 
 impl<'a> AnnotationEditor<'a> {
@@ -57,13 +60,15 @@ impl<'a> AnnotationEditor<'a> {
             line_range,
             is_edit: false,
             original_created_at: None,
+            annotation_id: None,
         }
     }
 
-    pub fn with_content(mut self, content: &str, created_at: SystemTime) -> Self {
+    pub fn with_content(mut self, content: &str, created_at: SystemTime, id: String) -> Self {
         self.textarea = TextArea::new(content.lines().map(String::from).collect());
         self.is_edit = true;
         self.original_created_at = Some(created_at);
+        self.annotation_id = Some(id);
 
         let t = theme::get();
         self.textarea.set_cursor_line_style(Style::default());
@@ -219,7 +224,12 @@ impl<'a> AnnotationEditor<'a> {
 
     /// Create a HunkAnnotation from the current editor state
     pub fn to_annotation(&self) -> HunkAnnotation {
+        let id = self
+            .annotation_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         HunkAnnotation {
+            id,
             file_index: self.file_index,
             hunk_index: self.hunk_index,
             content: self.textarea.lines().join("\n"),

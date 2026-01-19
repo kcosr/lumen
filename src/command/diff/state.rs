@@ -75,6 +75,8 @@ fn build_sidebar_visible_indices(
 /// Each annotation is uniquely identified by its file index and hunk index.
 #[derive(Clone)]
 pub struct HunkAnnotation {
+    /// Stable identifier for persistence
+    pub id: String,
     /// Index of the file in the file_diffs vector
     pub file_index: usize,
     /// Index of the hunk within the file (0-based)
