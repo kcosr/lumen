@@ -81,11 +81,7 @@ impl AnnotationFile {
     }
 
     pub fn upsert(&mut self, annotation: PersistentAnnotation) {
-        if let Some(existing) = self
-            .annotations
-            .iter_mut()
-            .find(|a| a.id == annotation.id)
-        {
+        if let Some(existing) = self.annotations.iter_mut().find(|a| a.id == annotation.id) {
             *existing = annotation;
         } else {
             self.annotations.push(annotation);
@@ -369,11 +365,9 @@ fn to_persistent(
             None,
             Some(base_commit_id.clone()),
         ),
-        DiffScope::Commit { commit_id } => (
-            Some(AnnotationScope::Commit),
-            Some(commit_id.clone()),
-            None,
-        ),
+        DiffScope::Commit { commit_id } => {
+            (Some(AnnotationScope::Commit), Some(commit_id.clone()), None)
+        }
     };
 
     PersistentAnnotation {
@@ -429,14 +423,14 @@ struct HunkContext {
 
 fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkContext {
     let diff = &state.file_diffs[annotation.file_index];
-    let side_by_side =
-        compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+    let side_by_side = compute_side_by_side(
+        &diff.old_content,
+        &diff.new_content,
+        state.settings.tab_width,
+    );
     let hunks = find_hunk_starts(&side_by_side);
 
-    let hunk_start = hunks
-        .get(annotation.hunk_index)
-        .copied()
-        .unwrap_or(0);
+    let hunk_start = hunks.get(annotation.hunk_index).copied().unwrap_or(0);
     let next_hunk_start = hunks
         .get(annotation.hunk_index + 1)
         .copied()
@@ -515,7 +509,12 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
     }
 
     let context_after: Vec<String> = side_by_side
-        .get(next_hunk_start..next_hunk_start.saturating_add(CONTEXT_LINES).min(side_by_side.len()))
+        .get(
+            next_hunk_start
+                ..next_hunk_start
+                    .saturating_add(CONTEXT_LINES)
+                    .min(side_by_side.len()),
+        )
         .unwrap_or(&[])
         .iter()
         .filter_map(|dl| {
@@ -551,8 +550,11 @@ fn find_matching_hunk(
     annotation: &PersistentAnnotation,
 ) -> Option<usize> {
     let diff = state.file_diffs.get(file_index)?;
-    let side_by_side =
-        compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+    let side_by_side = compute_side_by_side(
+        &diff.old_content,
+        &diff.new_content,
+        state.settings.tab_width,
+    );
     let hunks = find_hunk_starts(&side_by_side);
 
     if let Some(range) = annotation.new_line_range {

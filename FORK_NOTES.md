@@ -41,8 +41,9 @@ Status: implemented in this fork.
 
 ### Summary
 - Config-driven HTTP API (`api.enabled`, `api.bind`).
-- Endpoints for status, current hunk, current file, annotations, and create annotation.
-- `lumen-query` CLI for querying annotations.
+- Endpoints for status, current hunk, current file, annotations, create/update/delete annotation.
+- `lumen-cli` CLI for querying annotations (default text output, JSON available).
+- `/status` includes `cwd`; file paths in responses are relative to `cwd`.
 
 ### Non-goals
 - No streaming/watch mode.

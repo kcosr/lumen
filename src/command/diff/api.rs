@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -30,6 +30,15 @@ pub enum ApiCommand {
         content: String,
         respond_to: Sender<ApiResponse>,
     },
+    UpdateAnnotation {
+        id: String,
+        content: String,
+        respond_to: Sender<ApiResponse>,
+    },
+    DeleteAnnotation {
+        id: String,
+        respond_to: Sender<ApiResponse>,
+    },
 }
 
 #[derive(Debug)]
@@ -42,8 +51,7 @@ pub fn start_api_server(
     bind: &str,
     command_tx: Sender<ApiCommand>,
 ) -> io::Result<thread::JoinHandle<()>> {
-    let server = Server::http(bind)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let server = Server::http(bind).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     let bind_display = bind.to_string();
     let handle = thread::spawn(move || {
         for mut request in server.incoming_requests() {
@@ -51,53 +59,80 @@ pub fn start_api_server(
             let path = request.url().split('?').next().unwrap_or("");
 
             let response = match (method, path) {
-                (Method::Get, "/status") => dispatch(&command_tx, |respond_to| ApiCommand::Status {
-                    respond_to,
+                (Method::Get, "/status") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::Status { respond_to })
+                }
+                (Method::Get, "/current-hunk") => dispatch(&command_tx, |respond_to| {
+                    ApiCommand::CurrentHunk { respond_to }
                 }),
-                (Method::Get, "/current-hunk") => {
-                    dispatch(&command_tx, |respond_to| ApiCommand::CurrentHunk { respond_to })
-                }
-                (Method::Get, "/current-file") => {
-                    dispatch(&command_tx, |respond_to| ApiCommand::CurrentFile { respond_to })
-                }
-                (Method::Get, "/full-context") => {
-                    dispatch(&command_tx, |respond_to| ApiCommand::FullContext { respond_to })
-                }
-                (Method::Get, "/annotations") => dispatch(&command_tx, |respond_to| {
-                    ApiCommand::Annotations {
+                (Method::Get, "/current-file") => dispatch(&command_tx, |respond_to| {
+                    ApiCommand::CurrentFile { respond_to }
+                }),
+                (Method::Get, "/full-context") => dispatch(&command_tx, |respond_to| {
+                    ApiCommand::FullContext { respond_to }
+                }),
+                (Method::Get, "/annotations") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::Annotations {
                         current_only: false,
                         respond_to,
-                    }
-                }),
-                (Method::Get, "/annotations/current") => dispatch(&command_tx, |respond_to| {
-                    ApiCommand::Annotations {
+                    })
+                }
+                (Method::Get, "/annotations/current") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::Annotations {
                         current_only: true,
                         respond_to,
-                    }
-                }),
-                (Method::Post, "/annotation/create") => {
-                    let mut body = String::new();
-                    let reader = request.as_reader();
-                    if reader.read_to_string(&mut body).is_err() {
-                        ApiResponse {
-                            status: 400,
-                            body: json_error("invalid request body"),
-                        }
-                    } else {
-                        match serde_json::from_str::<Value>(&body)
-                            .ok()
-                            .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(String::from))
-                        {
-                            Some(content) => dispatch(&command_tx, |respond_to| {
-                                ApiCommand::CreateAnnotation { content, respond_to }
-                            }),
-                            None => ApiResponse {
-                                status: 400,
-                                body: json_error("missing content field"),
-                            },
-                        }
-                    }
+                    })
                 }
+                (Method::Post, "/annotation/create") => match read_json_body(&mut request) {
+                    Ok(payload) => match string_field(&payload, "content") {
+                        Some(content) => {
+                            dispatch(&command_tx, |respond_to| ApiCommand::CreateAnnotation {
+                                content,
+                                respond_to,
+                            })
+                        }
+                        None => ApiResponse {
+                            status: 400,
+                            body: json_error("missing content field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
+                (Method::Post, "/annotation/update") => match read_json_body(&mut request) {
+                    Ok(payload) => match (
+                        string_field(&payload, "id"),
+                        string_field(&payload, "content"),
+                    ) {
+                        (Some(id), Some(content)) => {
+                            dispatch(&command_tx, |respond_to| ApiCommand::UpdateAnnotation {
+                                id,
+                                content,
+                                respond_to,
+                            })
+                        }
+                        (None, _) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing id field"),
+                        },
+                        (_, None) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing content field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
+                (Method::Post, "/annotation/delete") => match read_json_body(&mut request) {
+                    Ok(payload) => match string_field(&payload, "id") {
+                        Some(id) => dispatch(&command_tx, |respond_to| {
+                            ApiCommand::DeleteAnnotation { id, respond_to }
+                        }),
+                        None => ApiResponse {
+                            status: 400,
+                            body: json_error("missing id field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
                 _ => ApiResponse {
                     status: 404,
                     body: json_error("not found"),
@@ -106,8 +141,8 @@ pub fn start_api_server(
 
             let status = StatusCode(response.status);
             let body = response.body.to_string();
-            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                .unwrap();
+            let header =
+                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
             let mut http_response = Response::from_string(body).with_status_code(status);
             http_response.add_header(header);
             let _ = request.respond(http_response);
@@ -139,6 +174,29 @@ where
             body: json_error("request timed out"),
         },
     }
+}
+
+fn read_json_body(request: &mut Request) -> Result<Value, ApiResponse> {
+    let mut body = String::new();
+    let reader = request.as_reader();
+    if reader.read_to_string(&mut body).is_err() {
+        return Err(ApiResponse {
+            status: 400,
+            body: json_error("invalid request body"),
+        });
+    }
+
+    serde_json::from_str::<Value>(&body).map_err(|_| ApiResponse {
+        status: 400,
+        body: json_error("invalid json body"),
+    })
+}
+
+fn string_field(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
 fn json_error(message: &str) -> Value {

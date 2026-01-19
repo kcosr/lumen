@@ -104,7 +104,10 @@ impl HunkAnnotation {
     #[cfg(not(feature = "jj"))]
     pub fn format_time(&self) -> String {
         use std::time::UNIX_EPOCH;
-        let duration = self.created_at.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let duration = self
+            .created_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let secs = duration.as_secs();
         let hours = (secs / 3600) % 24;
         let minutes = (secs / 60) % 60;
@@ -510,11 +513,9 @@ impl AppState {
 
     /// Add or update an annotation
     pub fn set_annotation(&mut self, annotation: HunkAnnotation) {
-        if let Some(existing) = self
-            .annotations
-            .iter_mut()
-            .find(|a| a.file_index == annotation.file_index && a.hunk_index == annotation.hunk_index)
-        {
+        if let Some(existing) = self.annotations.iter_mut().find(|a| {
+            a.file_index == annotation.file_index && a.hunk_index == annotation.hunk_index
+        }) {
             *existing = annotation;
         } else {
             self.annotations.push(annotation);
@@ -574,7 +575,10 @@ impl AppState {
                                 })
                                 .unwrap_or("base");
                             if old_start == old_end {
-                                output.push_str(&format!(" (deleted from {}:L{})", base_ref, old_start));
+                                output.push_str(&format!(
+                                    " (deleted from {}:L{})",
+                                    base_ref, old_start
+                                ));
                             } else {
                                 output.push_str(&format!(
                                     " (deleted from {}:L{}-{})",
@@ -631,12 +635,18 @@ impl AppState {
         hunk_index: usize,
     ) -> Option<(Option<(usize, usize)>, Option<(usize, usize)>, String)> {
         let diff = self.file_diffs.get(file_index)?;
-        let side_by_side =
-            compute_side_by_side(&diff.old_content, &diff.new_content, self.settings.tab_width);
+        let side_by_side = compute_side_by_side(
+            &diff.old_content,
+            &diff.new_content,
+            self.settings.tab_width,
+        );
         let hunks = find_hunk_starts(&side_by_side);
 
         let hunk_start = *hunks.get(hunk_index)?;
-        let next_hunk_start = hunks.get(hunk_index + 1).copied().unwrap_or(side_by_side.len());
+        let next_hunk_start = hunks
+            .get(hunk_index + 1)
+            .copied()
+            .unwrap_or(side_by_side.len());
 
         let mut diff_lines = String::new();
         let mut old_start: Option<usize> = None;

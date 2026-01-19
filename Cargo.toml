@@ -70,5 +70,5 @@ name = "lumen"
 path = "src/main.rs"
 
 [[bin]]
-name = "lumen-query"
-path = "src/bin/lumen-query.rs"
+name = "lumen-cli"
+path = "src/bin/lumen-cli.rs"
