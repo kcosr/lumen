@@ -273,7 +273,13 @@ impl PersistenceManager {
                 .iter()
                 .position(|f| f.filename == ann.filename)
             {
-                if let Some(hunk_index) = find_matching_hunk(state, file_index, ann) {
+                if let Some(hunk_index) = find_matching_hunk(
+                    state,
+                    file_index,
+                    ann.new_line_range,
+                    ann.old_line_range,
+                    &ann.context_changed,
+                ) {
                     let line_range = display_line_range(ann);
                     state.annotations.push(HunkAnnotation {
                         id: ann.id.clone(),
@@ -352,7 +358,8 @@ fn to_persistent(
     state: &AppState,
     scope: &DiffScope,
 ) -> PersistentAnnotation {
-    let hunk_context = extract_hunk_context(state, annotation);
+    let hunk_context = build_hunk_context(state, annotation.file_index, annotation.hunk_index)
+        .unwrap_or_else(HunkContext::empty);
     let created_at = annotation
         .created_at
         .duration_since(UNIX_EPOCH)
@@ -395,7 +402,14 @@ fn should_migrate_annotation(state: &AppState, annotation: &PersistentAnnotation
         .iter()
         .position(|f| f.filename == annotation.filename)
     {
-        find_matching_hunk(state, file_index, annotation).is_some()
+        find_matching_hunk(
+            state,
+            file_index,
+            annotation.new_line_range,
+            annotation.old_line_range,
+            &annotation.context_changed,
+        )
+        .is_some()
     } else {
         false
     }
@@ -411,14 +425,28 @@ fn display_line_range(annotation: &PersistentAnnotation) -> (usize, usize) {
     (0, 0)
 }
 
-struct HunkContext {
-    old_line_range: Option<(usize, usize)>,
-    new_line_range: Option<(usize, usize)>,
-    context_before: Vec<String>,
-    context_changed: Vec<String>,
-    context_after: Vec<String>,
-    diff_text: String,
-    change_type: String,
+pub(crate) struct HunkContext {
+    pub(crate) old_line_range: Option<(usize, usize)>,
+    pub(crate) new_line_range: Option<(usize, usize)>,
+    pub(crate) context_before: Vec<String>,
+    pub(crate) context_changed: Vec<String>,
+    pub(crate) context_after: Vec<String>,
+    pub(crate) diff_text: String,
+    pub(crate) change_type: String,
+}
+
+impl HunkContext {
+    fn empty() -> Self {
+        Self {
+            old_line_range: None,
+            new_line_range: None,
+            context_before: Vec::new(),
+            context_changed: Vec::new(),
+            context_after: Vec::new(),
+            diff_text: String::new(),
+            change_type: "modification".to_string(),
+        }
+    }
 }
 
 fn hunk_change_bounds(
@@ -440,21 +468,19 @@ fn hunk_change_bounds(
     first.zip(last)
 }
 
-fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkContext {
-    let diff = &state.file_diffs[annotation.file_index];
+pub(crate) fn build_hunk_context(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+) -> Option<HunkContext> {
+    let diff = state.file_diffs.get(file_index)?;
     let side_by_side = compute_side_by_side(
         &diff.old_content,
         &diff.new_content,
         state.settings.tab_width,
     );
     let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
-    let hunk_range = hunks
-        .get(annotation.hunk_index)
-        .copied()
-        .unwrap_or(HunkRange {
-            start: 0,
-            end: side_by_side.len(),
-        });
+    let hunk_range = *hunks.get(hunk_index)?;
     let (change_start, change_end) = hunk_change_bounds(&side_by_side, hunk_range)
         .unwrap_or((hunk_range.start, hunk_range.end.saturating_sub(1)));
 
@@ -556,7 +582,7 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
         "addition"
     };
 
-    HunkContext {
+    Some(HunkContext {
         old_line_range: old_start.zip(old_end),
         new_line_range: new_start.zip(new_end),
         context_before,
@@ -564,13 +590,15 @@ fn extract_hunk_context(state: &AppState, annotation: &HunkAnnotation) -> HunkCo
         context_after,
         diff_text,
         change_type: change_type.to_string(),
-    }
+    })
 }
 
-fn find_matching_hunk(
+pub(crate) fn find_matching_hunk(
     state: &AppState,
     file_index: usize,
-    annotation: &PersistentAnnotation,
+    new_line_range: Option<(usize, usize)>,
+    old_line_range: Option<(usize, usize)>,
+    context_changed: &[String],
 ) -> Option<usize> {
     let diff = state.file_diffs.get(file_index)?;
     let side_by_side = compute_side_by_side(
@@ -580,22 +608,22 @@ fn find_matching_hunk(
     );
     let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
 
-    if let Some(range) = annotation.new_line_range {
+    if let Some(range) = new_line_range {
         if let Some(idx) = match_hunk_by_range(&side_by_side, &hunks, range, true) {
             return Some(idx);
         }
     }
 
-    if let Some(range) = annotation.old_line_range {
+    if let Some(range) = old_line_range {
         if let Some(idx) = match_hunk_by_range(&side_by_side, &hunks, range, false) {
             return Some(idx);
         }
     }
 
-    if !annotation.context_changed.is_empty() {
+    if !context_changed.is_empty() {
         for (idx, hunk) in hunks.iter().enumerate() {
             let hunk_changed = hunk_changed_lines(&side_by_side, hunk.start, hunk.end);
-            if context_similarity(&hunk_changed, &annotation.context_changed)
+            if context_similarity(&hunk_changed, context_changed)
                 >= CONTEXT_MATCH_THRESHOLD
             {
                 return Some(idx);

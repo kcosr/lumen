@@ -519,6 +519,87 @@ fn annotation_json(annotation: &super::state::HunkAnnotation) -> Value {
     })
 }
 
+fn hunk_summary_json(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    hunk_range: HunkRange,
+    side_by_side: &[super::types::DiffLine],
+) -> Value {
+    let mut old_start = None;
+    let mut old_end = None;
+    let mut new_start = None;
+    let mut new_end = None;
+
+    for i in hunk_range.start..hunk_range.end {
+        let dl = &side_by_side[i];
+        if matches!(dl.change_type, ChangeType::Equal) {
+            continue;
+        }
+        match dl.change_type {
+            ChangeType::Delete => {
+                if let Some((num, _)) = &dl.old_line {
+                    if old_start.is_none() {
+                        old_start = Some(*num);
+                    }
+                    old_end = Some(*num);
+                }
+            }
+            ChangeType::Insert => {
+                if let Some((num, _)) = &dl.new_line {
+                    if new_start.is_none() {
+                        new_start = Some(*num);
+                    }
+                    new_end = Some(*num);
+                }
+            }
+            ChangeType::Modified => {
+                if let Some((num, _)) = &dl.old_line {
+                    if old_start.is_none() {
+                        old_start = Some(*num);
+                    }
+                    old_end = Some(*num);
+                }
+                if let Some((num, _)) = &dl.new_line {
+                    if new_start.is_none() {
+                        new_start = Some(*num);
+                    }
+                    new_end = Some(*num);
+                }
+            }
+            ChangeType::Equal => {}
+        }
+    }
+
+    let old_range = old_start.zip(old_end);
+    let new_range = new_start.zip(new_end);
+    let display_range = new_range.or(old_range).unwrap_or((0, 0));
+    let change_type = if old_start.is_some() && new_start.is_some() {
+        "modification"
+    } else if old_start.is_some() {
+        "deletion"
+    } else {
+        "addition"
+    };
+    let tags = state
+        .get_hunk_tags(file_index, hunk_index)
+        .map(|entry| entry.tags.clone())
+        .unwrap_or_default();
+    let annotation = state.get_annotation(file_index, hunk_index).map(annotation_json);
+
+    serde_json::json!({
+        "file": state.file_diffs[file_index].filename.clone(),
+        "file_index": file_index,
+        "hunk_index": hunk_index,
+        "line_range": [display_range.0, display_range.1],
+        "old_line_range": old_range,
+        "new_line_range": new_range,
+        "change_type": change_type,
+        "tags": tags,
+        "annotation": annotation,
+    })
+}
+
 fn update_annotation_content(
     state: &mut AppState,
     id: &str,
@@ -562,6 +643,10 @@ fn handle_api_command(
                         .or(context.old_line_range)
                         .unwrap_or((0, 0));
                     let annotation = state.get_annotation(file_index, hunk_index);
+                    let tags = state
+                        .get_hunk_tags(file_index, hunk_index)
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_default();
                     ApiResponse {
                         status: 200,
                         body: serde_json::json!({
@@ -577,6 +662,7 @@ fn handle_api_command(
                             "context_changed": context.context_changed,
                             "context_after": context.context_after,
                             "change_type": context.change_type,
+                            "tags": tags,
                             "annotation": annotation.map(annotation_json),
                         }),
                     }
@@ -625,6 +711,11 @@ fn handle_api_command(
                             .new_line_range
                             .or(context.old_line_range)
                             .unwrap_or((0, 0));
+                        let tags = state
+                            .get_hunk_tags(file_index, hunk_index)
+                            .map(|entry| entry.tags.clone())
+                            .unwrap_or_default();
+                        let annotation = state.get_annotation(file_index, hunk_index);
                         serde_json::json!({
                             "file": state.file_diffs[file_index].filename.clone(),
                             "file_index": file_index,
@@ -637,6 +728,8 @@ fn handle_api_command(
                             "context_changed": context.context_changed,
                             "context_after": context.context_after,
                             "change_type": context.change_type,
+                            "tags": tags,
+                            "annotation": annotation.map(annotation_json),
                         })
                     })
                 } else {
@@ -673,6 +766,90 @@ fn handle_api_command(
                     "annotations": annotations,
                 }),
             });
+        }
+        ApiCommand::Hunks {
+            current_only,
+            respond_to,
+        } => {
+            let mut hunks_json = Vec::new();
+            let file_indices: Vec<usize> = if current_only {
+                vec![state.current_file]
+            } else {
+                (0..state.file_diffs.len()).collect()
+            };
+
+            for file_index in file_indices {
+                let Some(diff) = state.file_diffs.get(file_index) else {
+                    continue;
+                };
+                let side_by_side = compute_side_by_side(
+                    &diff.old_content,
+                    &diff.new_content,
+                    state.settings.tab_width,
+                );
+                let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+                for (hunk_index, hunk_range) in hunks.iter().enumerate() {
+                    let summary =
+                        hunk_summary_json(state, file_index, hunk_index, *hunk_range, &side_by_side);
+                    hunks_json.push(summary);
+                }
+            }
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "scope": scope_json(current_scope, state),
+                    "hunks": hunks_json,
+                }),
+            });
+        }
+        ApiCommand::Hunk {
+            file_index,
+            hunk_index,
+            respond_to,
+        } => {
+            let response = if file_index < state.file_diffs.len() {
+                if let Some(context) = build_hunk_context(state, file_index, hunk_index) {
+                    let display_range = context
+                        .new_line_range
+                        .or(context.old_line_range)
+                        .unwrap_or((0, 0));
+                    let tags = state
+                        .get_hunk_tags(file_index, hunk_index)
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_default();
+                    let annotation = state.get_annotation(file_index, hunk_index);
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [display_range.0, display_range.1],
+                            "old_line_range": context.old_line_range,
+                            "new_line_range": context.new_line_range,
+                            "diff_text": context.diff_text,
+                            "context_before": context.context_before,
+                            "context_changed": context.context_changed,
+                            "context_after": context.context_after,
+                            "change_type": context.change_type,
+                            "tags": tags,
+                            "annotation": annotation.map(annotation_json),
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "file not found" }),
+                }
+            };
+            let _ = respond_to.send(response);
         }
         ApiCommand::CreateAnnotation {
             content,
@@ -718,6 +895,55 @@ fn handle_api_command(
                 ApiResponse {
                     status: 404,
                     body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::CreateAnnotationAt {
+            file_index,
+            hunk_index,
+            content,
+            respond_to,
+        } => {
+            let response = if content.trim().is_empty() {
+                ApiResponse {
+                    status: 400,
+                    body: serde_json::json!({ "error": "content cannot be empty" }),
+                }
+            } else if file_index < state.file_diffs.len() {
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    let annotation = super::state::HunkAnnotation {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        file_index,
+                        hunk_index,
+                        content: content.clone(),
+                        line_range,
+                        filename: state.file_diffs[file_index].filename.clone(),
+                        created_at: std::time::SystemTime::now(),
+                    };
+                    state.set_annotation(annotation.clone());
+                    if let (Some(scope), Some(persistence)) = (current_scope, persistence) {
+                        if let Err(err) = persistence.upsert_annotation(state, &annotation, scope) {
+                            eprintln!("Warning: failed to persist annotation: {}", err);
+                        }
+                    }
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "annotation": annotation_json(&annotation),
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "file not found" }),
                 }
             };
             let _ = respond_to.send(response);
@@ -879,6 +1105,75 @@ fn handle_api_command(
                 ApiResponse {
                     status: 404,
                     body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::TagsSetAt {
+            file_index,
+            hunk_index,
+            tags,
+            respond_to,
+        } => {
+            let response = if file_index < state.file_diffs.len() {
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    if let (Some(scope), Some(tag_manager)) = (current_scope, tag_manager) {
+                        let tags = tags
+                            .into_iter()
+                            .map(|tag| tag.trim().to_string())
+                            .filter(|tag| !tag.is_empty())
+                            .collect::<Vec<String>>();
+                        if tags.is_empty() {
+                            state.remove_hunk_tags(file_index, hunk_index);
+                        } else if let Some(diff) = state.file_diffs.get(file_index) {
+                            state.set_hunk_tags(super::state::HunkTags {
+                                file_index,
+                                hunk_index,
+                                filename: diff.filename.clone(),
+                                tags: tags.clone(),
+                            });
+                        }
+                        if let Err(err) = tag_manager.set_hunk_tags(
+                            &state,
+                            file_index,
+                            hunk_index,
+                            tags.clone(),
+                            scope,
+                        ) {
+                            ApiResponse {
+                                status: 500,
+                                body: serde_json::json!({ "error": err.to_string() }),
+                            }
+                        } else {
+                            state.tag_inventory = tag_manager.tags().to_vec();
+                            ApiResponse {
+                                status: 200,
+                                body: serde_json::json!({
+                                    "scope": scope_json(current_scope, state),
+                                    "file": state.file_diffs[file_index].filename.clone(),
+                                    "file_index": file_index,
+                                    "hunk_index": hunk_index,
+                                    "line_range": [line_range.0, line_range.1],
+                                    "tags": tags,
+                                }),
+                            }
+                        }
+                    } else {
+                        ApiResponse {
+                            status: 503,
+                            body: serde_json::json!({ "error": "tag storage unavailable" }),
+                        }
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "file not found" }),
                 }
             };
             let _ = respond_to.send(response);
@@ -1095,9 +1390,8 @@ fn run_app_internal(
     } else {
         ViewStateManager::try_new()?
     };
-    let mut current_scope = None;
-    if let Some(ref mut persistence) = persistence {
-        current_scope = load_persistence_for_state(
+    let mut current_scope = if let Some(ref mut persistence) = persistence {
+        load_persistence_for_state(
             persistence,
             view_state.as_mut(),
             tag_manager.as_mut(),
@@ -1105,10 +1399,10 @@ fn run_app_internal(
             &mut state,
             &options,
             backend,
-        );
+        )
     } else {
-        current_scope = determine_scope(&state, &options, backend);
-        if let Some(ref scope) = current_scope {
+        let scope = determine_scope(&state, &options, backend);
+        if let Some(ref scope) = scope {
             if let Some(ref mut tag_manager) = tag_manager {
                 if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
                     eprintln!("Warning: failed to load tags: {}", err);
@@ -1120,7 +1414,8 @@ fn run_app_internal(
                 }
             }
         }
-    }
+        scope
+    };
 
     // Load viewed files from GitHub on startup in PR mode
     if let Some(ref pr) = pr_info {
@@ -1172,6 +1467,24 @@ fn run_app_internal(
             // Re-sync viewed files from GitHub in PR mode
             if let Some(ref pr) = pr_info {
                 sync_viewed_files_from_github(pr, &mut state);
+            }
+
+            if let Some(scope) = current_scope.as_ref() {
+                if let Some(ref mut persistence) = persistence {
+                    if let Err(err) = persistence.load_for_scope(&mut state, scope) {
+                        eprintln!("Warning: failed to reload annotations: {}", err);
+                    }
+                }
+                if let Some(ref mut tag_manager) = tag_manager {
+                    if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
+                        eprintln!("Warning: failed to reload tags: {}", err);
+                    }
+                }
+                if let Some(ref review_manager) = review_manager {
+                    if let Err(err) = review_manager.load_for_scope(&mut state, scope) {
+                        eprintln!("Warning: failed to reload reviewed hunks: {}", err);
+                    }
+                }
             }
             apply_filters(&mut state);
         }

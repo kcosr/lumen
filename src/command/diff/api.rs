@@ -22,11 +22,26 @@ pub enum ApiCommand {
     FullContext {
         respond_to: Sender<ApiResponse>,
     },
+    Hunks {
+        current_only: bool,
+        respond_to: Sender<ApiResponse>,
+    },
+    Hunk {
+        file_index: usize,
+        hunk_index: usize,
+        respond_to: Sender<ApiResponse>,
+    },
     Annotations {
         current_only: bool,
         respond_to: Sender<ApiResponse>,
     },
     CreateAnnotation {
+        content: String,
+        respond_to: Sender<ApiResponse>,
+    },
+    CreateAnnotationAt {
+        file_index: usize,
+        hunk_index: usize,
         content: String,
         respond_to: Sender<ApiResponse>,
     },
@@ -46,6 +61,12 @@ pub enum ApiCommand {
         respond_to: Sender<ApiResponse>,
     },
     TagsSet {
+        tags: Vec<String>,
+        respond_to: Sender<ApiResponse>,
+    },
+    TagsSetAt {
+        file_index: usize,
+        hunk_index: usize,
         tags: Vec<String>,
         respond_to: Sender<ApiResponse>,
     },
@@ -80,6 +101,41 @@ pub fn start_api_server(
                 (Method::Get, "/full-context") => dispatch(&command_tx, |respond_to| {
                     ApiCommand::FullContext { respond_to }
                 }),
+                (Method::Get, "/hunks") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::Hunks {
+                        current_only: false,
+                        respond_to,
+                    })
+                }
+                (Method::Get, "/hunks/current") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::Hunks {
+                        current_only: true,
+                        respond_to,
+                    })
+                }
+                (Method::Post, "/hunk") => match read_json_body(&mut request) {
+                    Ok(payload) => match (
+                        usize_field(&payload, "file_index"),
+                        usize_field(&payload, "hunk_index"),
+                    ) {
+                        (Some(file_index), Some(hunk_index)) => {
+                            dispatch(&command_tx, |respond_to| ApiCommand::Hunk {
+                                file_index,
+                                hunk_index,
+                                respond_to,
+                            })
+                        }
+                        (None, _) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing file_index field"),
+                        },
+                        (_, None) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing hunk_index field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
                 (Method::Get, "/annotations") => {
                     dispatch(&command_tx, |respond_to| ApiCommand::Annotations {
                         current_only: false,
@@ -101,6 +157,35 @@ pub fn start_api_server(
                             })
                         }
                         None => ApiResponse {
+                            status: 400,
+                            body: json_error("missing content field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
+                (Method::Post, "/annotation/create-target") => match read_json_body(&mut request) {
+                    Ok(payload) => match (
+                        usize_field(&payload, "file_index"),
+                        usize_field(&payload, "hunk_index"),
+                        string_field(&payload, "content"),
+                    ) {
+                        (Some(file_index), Some(hunk_index), Some(content)) => {
+                            dispatch(&command_tx, |respond_to| ApiCommand::CreateAnnotationAt {
+                                file_index,
+                                hunk_index,
+                                content,
+                                respond_to,
+                            })
+                        }
+                        (None, _, _) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing file_index field"),
+                        },
+                        (_, None, _) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing hunk_index field"),
+                        },
+                        (_, _, None) => ApiResponse {
                             status: 400,
                             body: json_error("missing content field"),
                         },
@@ -155,6 +240,35 @@ pub fn start_api_server(
                             respond_to,
                         }),
                         None => ApiResponse {
+                            status: 400,
+                            body: json_error("missing tags field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
+                (Method::Post, "/tags/set-target") => match read_json_body(&mut request) {
+                    Ok(payload) => match (
+                        usize_field(&payload, "file_index"),
+                        usize_field(&payload, "hunk_index"),
+                        string_array_field(&payload, "tags"),
+                    ) {
+                        (Some(file_index), Some(hunk_index), Some(tags)) => {
+                            dispatch(&command_tx, |respond_to| ApiCommand::TagsSetAt {
+                                file_index,
+                                hunk_index,
+                                tags,
+                                respond_to,
+                            })
+                        }
+                        (None, _, _) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing file_index field"),
+                        },
+                        (_, None, _) => ApiResponse {
+                            status: 400,
+                            body: json_error("missing hunk_index field"),
+                        },
+                        (_, _, None) => ApiResponse {
                             status: 400,
                             body: json_error("missing tags field"),
                         },
@@ -235,6 +349,10 @@ fn string_array_field(payload: &Value, key: &str) -> Option<Vec<String>> {
                 .collect()
         })
     })
+}
+
+fn usize_field(payload: &Value, key: &str) -> Option<usize> {
+    payload.get(key).and_then(|value| value.as_u64()).map(|v| v as usize)
 }
 
 fn json_error(message: &str) -> Value {

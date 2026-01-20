@@ -6,10 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::diff_algo::{compute_side_by_side, find_hunk_ranges};
-use super::persistence::DiffScope;
+use super::persistence::{build_hunk_context, find_matching_hunk, DiffScope};
 use super::state::{AppState, HunkReview};
 
-const REVIEW_VERSION: u32 = 1;
+const REVIEW_VERSION: u32 = 2;
 const REVIEW_DIR: &str = ".lumen/review";
 const REVIEW_INDEX_FILE: &str = "working-tree.json";
 
@@ -36,6 +36,12 @@ struct ReviewFile {
 struct PersistentReview {
     filename: String,
     hunk_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_line_range: Option<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new_line_range:  Option<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    context_changed: Vec<String>,
 }
 
 pub struct ReviewManager {
@@ -74,10 +80,26 @@ impl ReviewManager {
 
         for hunk in review_file.hunks {
             if let Some(&(file_index, hunk_count)) = file_info.get(hunk.filename.as_str()) {
-                if hunk.hunk_index < hunk_count {
+                let mut matched = None;
+                if hunk.new_line_range.is_some()
+                    || hunk.old_line_range.is_some()
+                    || !hunk.context_changed.is_empty()
+                {
+                    matched = find_matching_hunk(
+                        state,
+                        file_index,
+                        hunk.new_line_range,
+                        hunk.old_line_range,
+                        &hunk.context_changed,
+                    );
+                }
+                if matched.is_none() && hunk.hunk_index < hunk_count {
+                    matched = Some(hunk.hunk_index);
+                }
+                if let Some(hunk_index) = matched {
                     state.reviewed_hunks.push(HunkReview {
                         file_index,
-                        hunk_index: hunk.hunk_index,
+                        hunk_index,
                         filename: hunk.filename,
                     });
                 }
@@ -101,15 +123,47 @@ impl ReviewManager {
             None => return Ok(()),
         };
 
+        let hunk_context = build_hunk_context(state, file_index, hunk_index);
         if reviewed {
-            if !review_file
+            let mut matched_pos = review_file
                 .hunks
                 .iter()
-                .any(|hunk| hunk.filename == filename && hunk.hunk_index == hunk_index)
-            {
+                .position(|hunk| hunk.filename == filename && hunk.hunk_index == hunk_index);
+            if matched_pos.is_none() {
+                matched_pos = review_file.hunks.iter().position(|hunk| {
+                    if hunk.filename != filename {
+                        return false;
+                    }
+                    find_matching_hunk(
+                        state,
+                        file_index,
+                        hunk.new_line_range,
+                        hunk.old_line_range,
+                        &hunk.context_changed,
+                    ) == Some(hunk_index)
+                });
+            }
+            if let Some(pos) = matched_pos {
+                let existing = &mut review_file.hunks[pos];
+                existing.hunk_index = hunk_index;
+                existing.old_line_range =
+                    hunk_context.as_ref().and_then(|ctx| ctx.old_line_range);
+                existing.new_line_range =
+                    hunk_context.as_ref().and_then(|ctx| ctx.new_line_range);
+                existing.context_changed = hunk_context
+                    .as_ref()
+                    .map(|ctx| ctx.context_changed.clone())
+                    .unwrap_or_default();
+            } else {
                 review_file.hunks.push(PersistentReview {
                     filename,
                     hunk_index,
+                    old_line_range: hunk_context.as_ref().and_then(|ctx| ctx.old_line_range),
+                    new_line_range: hunk_context.as_ref().and_then(|ctx| ctx.new_line_range),
+                    context_changed: hunk_context
+                        .as_ref()
+                        .map(|ctx| ctx.context_changed.clone())
+                        .unwrap_or_default(),
                 });
             }
         } else {
