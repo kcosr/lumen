@@ -126,8 +126,13 @@ Notes:
 - Sidebar list filters to files with matching hunks while a filter is active.
 
 ### API + CLI
+- HTTP: `GET /hunks`, `GET /hunks/current`, `POST /hunk` with `{ "file_index": 0, "hunk_index": 1 }`.
 - HTTP: `GET /tags`, `GET /tags/current`, `POST /tags/set` with `{ "tags": ["foo"] }`.
-- CLI: `lumen-cli tag list|current|set <tags..>|add <tag>|remove <tag>|clear`.
+- HTTP: `POST /tags/set-target` with `{ "file_index": 0, "hunk_index": 1, "tags": ["foo"] }`.
+- HTTP: `POST /annotation/create-target` with `{ "file_index": 0, "hunk_index": 1, "content": "..." }`.
+- CLI: `lumen-cli hunks [--current]`, `lumen-cli hunk <file_index> <hunk_index>`.
+- CLI: `lumen-cli tag list|current|set <tags..>|add <tag>|remove <tag>|clear [--file-index N --hunk-index M]`.
+- CLI: `lumen-cli tags [--current]`.
 
 ## Hunk Reviews
 

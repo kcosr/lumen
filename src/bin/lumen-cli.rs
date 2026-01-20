@@ -38,6 +38,21 @@ enum Commands {
     /// Get focused hunk details
     CurrentHunk,
 
+    /// List hunks
+    Hunks {
+        /// Show only current file
+        #[arg(long)]
+        current: bool,
+    },
+
+    /// Get hunk details by index
+    Hunk {
+        /// File index from status/hunks output
+        file_index: usize,
+        /// Hunk index from hunks output
+        hunk_index: usize,
+    },
+
     /// Get current file content
     CurrentFile {
         /// Show only new content
@@ -60,6 +75,12 @@ enum Commands {
     Annotate {
         /// Annotation text
         text: String,
+        /// Target file index
+        #[arg(long)]
+        file_index: Option<usize>,
+        /// Target hunk index
+        #[arg(long)]
+        hunk_index: Option<usize>,
     },
 
     /// Update an annotation by id
@@ -87,6 +108,13 @@ enum Commands {
         #[command(subcommand)]
         action: TagCommands,
     },
+
+    /// List tags per hunk
+    Tags {
+        /// Show only current file
+        #[arg(long)]
+        current: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,22 +130,47 @@ enum TagCommands {
         /// Tags to set on the focused hunk
         #[arg(required = true)]
         tags: Vec<String>,
+        /// Target file index
+        #[arg(long)]
+        file_index: Option<usize>,
+        /// Target hunk index
+        #[arg(long)]
+        hunk_index: Option<usize>,
     },
 
     /// Add a tag to the focused hunk
     Add {
         /// Tag to add
         tag: String,
+        /// Target file index
+        #[arg(long)]
+        file_index: Option<usize>,
+        /// Target hunk index
+        #[arg(long)]
+        hunk_index: Option<usize>,
     },
 
     /// Remove a tag from the focused hunk
     Remove {
         /// Tag to remove
         tag: String,
+        /// Target file index
+        #[arg(long)]
+        file_index: Option<usize>,
+        /// Target hunk index
+        #[arg(long)]
+        hunk_index: Option<usize>,
     },
 
     /// Clear all tags from the focused hunk
-    Clear,
+    Clear {
+        /// Target file index
+        #[arg(long)]
+        file_index: Option<usize>,
+        /// Target hunk index
+        #[arg(long)]
+        hunk_index: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +185,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Commands::CurrentHunk => {
             let data = get(&cli.url, "/current-hunk").await?;
             print_output(&data, &cli.format, OutputKind::CurrentHunk)?;
+        }
+        Commands::Hunks { current } => {
+            let endpoint = if current { "/hunks/current" } else { "/hunks" };
+            let data = get(&cli.url, endpoint).await?;
+            print_output(&data, &cli.format, OutputKind::Hunks)?;
+        }
+        Commands::Hunk {
+            file_index,
+            hunk_index,
+        } => {
+            let payload = serde_json::json!({
+                "file_index": file_index,
+                "hunk_index": hunk_index,
+            });
+            let data = post(&cli.url, "/hunk", payload).await?;
+            print_output(&data, &cli.format, OutputKind::Hunk)?;
         }
         Commands::CurrentFile { new_only, old_only } => {
             let data = get(&cli.url, "/current-file").await?;
@@ -152,9 +221,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let data = get(&cli.url, endpoint).await?;
             print_output(&data, &cli.format, OutputKind::Annotations)?;
         }
-        Commands::Annotate { text } => {
-            let payload = serde_json::json!({ "content": text });
-            let data = post(&cli.url, "/annotation/create", payload).await?;
+        Commands::Annotate {
+            text,
+            file_index,
+            hunk_index,
+        } => {
+            let payload = if let Some((file_index, hunk_index)) =
+                target_indices(file_index, hunk_index)?
+            {
+                serde_json::json!({
+                    "file_index": file_index,
+                    "hunk_index": hunk_index,
+                    "content": text,
+                })
+            } else {
+                serde_json::json!({ "content": text })
+            };
+            let endpoint = if payload.get("file_index").is_some() {
+                "/annotation/create-target"
+            } else {
+                "/annotation/create"
+            };
+            let data = post(&cli.url, endpoint, payload).await?;
             print_output(
                 &data,
                 &cli.format,
@@ -203,42 +291,124 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let data = get(&cli.url, "/tags/current").await?;
                 print_output(&data, &cli.format, OutputKind::TagsCurrent)?;
             }
-            TagCommands::Set { tags } => {
-                let payload = serde_json::json!({ "tags": normalize_tags(tags) });
-                let data = post(&cli.url, "/tags/set", payload).await?;
+            TagCommands::Set {
+                tags,
+                file_index,
+                hunk_index,
+            } => {
+                let normalized = normalize_tags(tags);
+                let payload = if let Some((file_index, hunk_index)) =
+                    target_indices(file_index, hunk_index)?
+                {
+                    serde_json::json!({
+                        "file_index": file_index,
+                        "hunk_index": hunk_index,
+                        "tags": normalized,
+                    })
+                } else {
+                    serde_json::json!({ "tags": normalized })
+                };
+                let endpoint = if payload.get("file_index").is_some() {
+                    "/tags/set-target"
+                } else {
+                    "/tags/set"
+                };
+                let data = post(&cli.url, endpoint, payload).await?;
                 print_output(
                     &data,
                     &cli.format,
                     OutputKind::TagsAction { action: "updated" },
                 )?;
             }
-            TagCommands::Add { tag } => {
-                let mut tags = fetch_current_tags(&cli.url).await?;
+            TagCommands::Add {
+                tag,
+                file_index,
+                hunk_index,
+            } => {
+                let target = target_indices(file_index, hunk_index)?;
+                let mut tags = if let Some((file_index, hunk_index)) = target {
+                    fetch_hunk_tags(&cli.url, file_index, hunk_index).await?
+                } else {
+                    fetch_current_tags(&cli.url).await?
+                };
                 if !tags.contains(&tag) {
                     tags.push(tag);
                 }
-                let payload = serde_json::json!({ "tags": normalize_tags(tags) });
-                let data = post(&cli.url, "/tags/set", payload).await?;
+                let payload = if let Some((file_index, hunk_index)) = target {
+                    serde_json::json!({
+                        "file_index": file_index,
+                        "hunk_index": hunk_index,
+                        "tags": normalize_tags(tags),
+                    })
+                } else {
+                    serde_json::json!({ "tags": normalize_tags(tags) })
+                };
+                let endpoint = if payload.get("file_index").is_some() {
+                    "/tags/set-target"
+                } else {
+                    "/tags/set"
+                };
+                let data = post(&cli.url, endpoint, payload).await?;
                 print_output(
                     &data,
                     &cli.format,
                     OutputKind::TagsAction { action: "updated" },
                 )?;
             }
-            TagCommands::Remove { tag } => {
-                let mut tags = fetch_current_tags(&cli.url).await?;
+            TagCommands::Remove {
+                tag,
+                file_index,
+                hunk_index,
+            } => {
+                let target = target_indices(file_index, hunk_index)?;
+                let mut tags = if let Some((file_index, hunk_index)) = target {
+                    fetch_hunk_tags(&cli.url, file_index, hunk_index).await?
+                } else {
+                    fetch_current_tags(&cli.url).await?
+                };
                 tags.retain(|t| t != &tag);
-                let payload = serde_json::json!({ "tags": normalize_tags(tags) });
-                let data = post(&cli.url, "/tags/set", payload).await?;
+                let payload = if let Some((file_index, hunk_index)) = target {
+                    serde_json::json!({
+                        "file_index": file_index,
+                        "hunk_index": hunk_index,
+                        "tags": normalize_tags(tags),
+                    })
+                } else {
+                    serde_json::json!({ "tags": normalize_tags(tags) })
+                };
+                let endpoint = if payload.get("file_index").is_some() {
+                    "/tags/set-target"
+                } else {
+                    "/tags/set"
+                };
+                let data = post(&cli.url, endpoint, payload).await?;
                 print_output(
                     &data,
                     &cli.format,
                     OutputKind::TagsAction { action: "updated" },
                 )?;
             }
-            TagCommands::Clear => {
-                let payload = serde_json::json!({ "tags": [] });
-                let data = post(&cli.url, "/tags/set", payload).await?;
+            TagCommands::Clear {
+                file_index,
+                hunk_index,
+            } => {
+                let payload = if let Some((file_index, hunk_index)) =
+                    target_indices(file_index, hunk_index)?
+                {
+                    serde_json::json!({
+                        "file_index": file_index,
+                        "hunk_index": hunk_index,
+                        "tags": [],
+                    })
+                } else {
+                    serde_json::json!({ "tags": [] })
+                };
+                let endpoint = if payload.get("file_index").is_some() {
+                    "/tags/set-target"
+                } else {
+                    "/tags/set"
+                };
+                let data = post(&cli.url, endpoint, payload).await?;
                 print_output(
                     &data,
                     &cli.format,
@@ -246,6 +416,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )?;
             }
         },
+        Commands::Tags { current } => {
+            let endpoint = if current { "/hunks/current" } else { "/hunks" };
+            let data = get(&cli.url, endpoint).await?;
+            let filtered = filter_hunks_with_tags(&data);
+            print_output(&filtered, &cli.format, OutputKind::Hunks)?;
+        }
     }
 
     Ok(())
@@ -280,6 +456,8 @@ enum OutputKind {
     CurrentFile,
     Annotations,
     Annotation { action: &'static str },
+    Hunks,
+    Hunk,
     TagsList,
     TagsCurrent,
     TagsAction { action: &'static str },
@@ -298,6 +476,8 @@ fn print_output(
             OutputKind::CurrentFile => print_text_current_file(data),
             OutputKind::Annotations => print_text_annotations(data),
             OutputKind::Annotation { action } => print_text_annotation(data, action),
+            OutputKind::Hunks => print_text_hunks(data),
+            OutputKind::Hunk => print_text_hunk(data),
             OutputKind::TagsList => print_text_tags_list(data),
             OutputKind::TagsCurrent => print_text_tags_current(data),
             OutputKind::TagsAction { action } => print_text_tags_action(data, action),
@@ -421,6 +601,13 @@ fn print_text_current_hunk(data: &Value) {
     print_context_block("context_changed", data.get("context_changed"));
     print_context_block("context_after", data.get("context_after"));
 
+    let tags = extract_tags(data);
+    if tags.is_empty() {
+        println!("\ntags: none");
+    } else {
+        println!("\ntags: {}", tags.join(", "));
+    }
+
     let annotation = data.get("annotation").and_then(|v| v.as_object());
     if let Some(annotation) = annotation {
         println!(
@@ -491,6 +678,66 @@ fn print_text_annotation(data: &Value, action: &str) {
     } else {
         println!("annotation {}.", action);
     }
+}
+
+fn print_text_hunks(data: &Value) {
+    let hunks = data
+        .get("hunks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    println!("hunks: {}", hunks.len());
+    for hunk in hunks {
+        print_text_hunk_line(&hunk);
+    }
+}
+
+fn print_text_hunk(data: &Value) {
+    print_text_hunk_line(data);
+    if let Some(diff_text) = data.get("diff_text").and_then(|v| v.as_str()) {
+        if !diff_text.is_empty() {
+            println!("\n{}", diff_text.trim_end());
+        }
+    }
+}
+
+fn print_text_hunk_line(hunk: &Value) {
+    let file = hunk.get("file").and_then(|v| v.as_str()).unwrap_or("-");
+    let file_index = hunk
+        .get("file_index")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let hunk_index = hunk
+        .get("hunk_index")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let line_range = format_range(hunk.get("line_range")).unwrap_or_else(|| "-".to_string());
+    let change_type = hunk.get("change_type").and_then(|v| v.as_str()).unwrap_or("-");
+    let tags = extract_tags(hunk);
+    let annotation_id = hunk
+        .get("annotation")
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let tags_display = if tags.is_empty() {
+        "tags: (none)".to_string()
+    } else {
+        format!("tags: {}", tags.join(", "))
+    };
+    let annotation_display = if annotation_id.is_empty() {
+        "annotation: (none)".to_string()
+    } else {
+        format!("annotation: {}", annotation_id)
+    };
+
+    println!(
+        "- {} ({}:{}): {} [{}] {}",
+        file, file_index, hunk_index, line_range, change_type, annotation_display
+    );
+    println!("  {}", tags_display);
 }
 
 fn print_text_tags_list(data: &Value) {
@@ -583,6 +830,30 @@ async fn fetch_current_tags(base_url: &str) -> Result<Vec<String>, Box<dyn Error
     Ok(extract_tags(&data))
 }
 
+async fn fetch_hunk_tags(
+    base_url: &str,
+    file_index: usize,
+    hunk_index: usize,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let payload = serde_json::json!({
+        "file_index": file_index,
+        "hunk_index": hunk_index,
+    });
+    let data = post(base_url, "/hunk", payload).await?;
+    Ok(extract_tags(&data))
+}
+
+fn target_indices(
+    file_index: Option<usize>,
+    hunk_index: Option<usize>,
+) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
+    match (file_index, hunk_index) {
+        (Some(file_index), Some(hunk_index)) => Ok(Some((file_index, hunk_index))),
+        (None, None) => Ok(None),
+        _ => Err("Both --file-index and --hunk-index must be provided".into()),
+    }
+}
+
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
     let mut normalized: Vec<String> = tags
         .into_iter()
@@ -602,6 +873,19 @@ fn format_range(value: Option<&Value>) -> Option<String> {
     let start = arr.get(0)?.as_u64()?;
     let end = arr.get(1)?.as_u64()?;
     Some(format!("{}-{}", start, end))
+}
+
+fn filter_hunks_with_tags(data: &Value) -> Value {
+    let mut hunks = data
+        .get("hunks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    hunks.retain(|hunk| !extract_tags(hunk).is_empty());
+    serde_json::json!({
+        "scope": data.get("scope").cloned().unwrap_or(Value::Null),
+        "hunks": hunks,
+    })
 }
 
 fn format_annotation_line(annotation: &Value) -> Option<String> {
