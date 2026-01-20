@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 use crossterm::{
@@ -13,17 +13,25 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use super::diff_algo::{compute_side_by_side, find_hunk_starts};
+use super::annotation::{AnnotationEditor, AnnotationEditorResult};
+use super::api::{start_api_server, ApiCommand, ApiResponse};
+use super::diff_algo::{compute_side_by_side, find_hunk_ranges, HunkRange};
 use super::git::{
     get_current_branch, load_file_diffs, load_pr_file_diffs, load_single_commit_diffs,
 };
 use super::highlight;
+use super::persistence::{DiffScope, PersistenceManager};
+use super::review::ReviewManager;
+use super::tag_editor::{TagEditor, TagEditorResult};
+use super::tags::TagManager;
+use super::view_state::ViewStateManager;
 use super::render::{
     render_diff, render_empty_state, truncate_path, FilePickerItem, KeyBind, KeyBindSection, Modal,
     ModalContent, ModalFileStatus, ModalResult,
 };
-use super::annotation::{AnnotationEditor, AnnotationEditorResult};
-use super::state::{adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey};
+use super::state::{
+    adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey, ReviewFilter, TagFilter,
+};
 use super::theme;
 use super::types::{ChangeType, DiffFullscreen, FileStatus, FocusedPanel, SidebarItem};
 use super::watcher::{setup_watcher, WatchEvent};
@@ -32,6 +40,8 @@ use super::{
 };
 use crate::commit_reference::CommitReference;
 use crate::vcs::{StackedCommitInfo, VcsBackend};
+use serde_json::Value;
+use std::time::UNIX_EPOCH;
 
 /// Navigate to a different commit in stacked mode.
 /// Returns true if navigation was successful.
@@ -82,6 +92,880 @@ fn format_annotation_preview(annotation: &super::state::HunkAnnotation) -> Strin
         preview,
         annotation.format_time()
     )
+}
+
+fn scope_json(scope: Option<&DiffScope>, state: &AppState) -> Value {
+    match scope {
+        Some(DiffScope::WorkingTree { base_commit_id }) => serde_json::json!({
+            "type": "working_tree",
+            "base_commit_id": base_commit_id,
+            "diff_reference": state.diff_reference.clone(),
+            "vcs": state.vcs_name,
+        }),
+        Some(DiffScope::Commit { commit_id }) => serde_json::json!({
+            "type": "commit",
+            "commit_id": commit_id,
+            "diff_reference": state.diff_reference.clone(),
+            "vcs": state.vcs_name,
+        }),
+        None => serde_json::json!({
+            "type": "unknown",
+            "diff_reference": state.diff_reference.clone(),
+            "vcs": state.vcs_name,
+        }),
+    }
+}
+
+fn status_json(state: &AppState, scope: Option<&DiffScope>) -> Value {
+    let diff = state.file_diffs.get(state.current_file);
+    let hunk_count = diff
+        .map(|diff| {
+            let side_by_side = compute_side_by_side(
+                &diff.old_content,
+                &diff.new_content,
+                state.settings.tab_width,
+            );
+            find_hunk_ranges(&side_by_side, state.settings.unified_context).len()
+        })
+        .unwrap_or(0);
+
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+
+    serde_json::json!({
+        "cwd": cwd,
+        "scope": scope_json(scope, state),
+        "current_file": diff.map(|d| d.filename.clone()),
+        "current_file_index": state.current_file,
+        "focused_hunk": state.focused_hunk,
+        "hunk_count": hunk_count,
+        "annotations_count": state.annotations.len(),
+    })
+}
+
+fn file_status_str(status: &FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "added",
+        FileStatus::Deleted => "deleted",
+        FileStatus::Modified => "modified",
+    }
+}
+
+fn hunk_change_bounds(
+    side_by_side: &[super::types::DiffLine],
+    hunk_range: HunkRange,
+) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+    for i in hunk_range.start..hunk_range.end {
+        if let Some(dl) = side_by_side.get(i) {
+            if !matches!(dl.change_type, ChangeType::Equal) {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = Some(i);
+            }
+        }
+    }
+    first.zip(last)
+}
+
+struct HunkContext {
+    old_line_range: Option<(usize, usize)>,
+    new_line_range: Option<(usize, usize)>,
+    context_before: Vec<String>,
+    context_changed: Vec<String>,
+    context_after: Vec<String>,
+    diff_text: String,
+    change_type: String,
+}
+
+fn build_hunk_context(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+) -> Option<HunkContext> {
+    let diff = state.file_diffs.get(file_index)?;
+    let side_by_side = compute_side_by_side(
+        &diff.old_content,
+        &diff.new_content,
+        state.settings.tab_width,
+    );
+    let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+
+    let hunk_range = *hunks.get(hunk_index)?;
+    let (change_start, change_end) = hunk_change_bounds(&side_by_side, hunk_range)?;
+
+    let context_before: Vec<String> = side_by_side
+        .get(change_start.saturating_sub(3)..change_start)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|dl| {
+            dl.new_line
+                .as_ref()
+                .or(dl.old_line.as_ref())
+                .map(|(_, text)| text.clone())
+        })
+        .collect();
+
+    let mut context_changed = Vec::new();
+    let mut diff_text = String::new();
+    let mut old_start = None;
+    let mut old_end = None;
+    let mut new_start = None;
+    let mut new_end = None;
+
+    for i in hunk_range.start..hunk_range.end {
+        let dl = &side_by_side[i];
+        if matches!(dl.change_type, ChangeType::Equal) {
+            continue;
+        }
+
+        match dl.change_type {
+            ChangeType::Delete => {
+                if let Some((num, text)) = &dl.old_line {
+                    let line = format!("- {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if old_start.is_none() {
+                        old_start = Some(*num);
+                    }
+                    old_end = Some(*num);
+                }
+            }
+            ChangeType::Insert => {
+                if let Some((num, text)) = &dl.new_line {
+                    let line = format!("+ {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if new_start.is_none() {
+                        new_start = Some(*num);
+                    }
+                    new_end = Some(*num);
+                }
+            }
+            ChangeType::Modified => {
+                if let Some((num, text)) = &dl.old_line {
+                    let line = format!("- {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if old_start.is_none() {
+                        old_start = Some(*num);
+                    }
+                    old_end = Some(*num);
+                }
+                if let Some((num, text)) = &dl.new_line {
+                    let line = format!("+ {}", text);
+                    context_changed.push(line.clone());
+                    diff_text.push_str(&format!("{}\n", line));
+                    if new_start.is_none() {
+                        new_start = Some(*num);
+                    }
+                    new_end = Some(*num);
+                }
+            }
+            ChangeType::Equal => {}
+        }
+    }
+
+    let context_after: Vec<String> = side_by_side
+        .get(
+            change_end.saturating_add(1)
+                ..change_end
+                    .saturating_add(1)
+                    .saturating_add(3)
+                    .min(side_by_side.len()),
+        )
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|dl| {
+            dl.new_line
+                .as_ref()
+                .or(dl.old_line.as_ref())
+                .map(|(_, text)| text.clone())
+        })
+        .collect();
+
+    let change_type = if old_start.is_some() && new_start.is_some() {
+        "modification"
+    } else if old_start.is_some() {
+        "deletion"
+    } else {
+        "addition"
+    };
+
+    Some(HunkContext {
+        old_line_range: old_start.zip(old_end),
+        new_line_range: new_start.zip(new_end),
+        context_before,
+        context_changed,
+        context_after,
+        diff_text,
+        change_type: change_type.to_string(),
+    })
+}
+
+fn compute_hunk_line_range(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+) -> Option<(usize, usize)> {
+    let diff = state.file_diffs.get(file_index)?;
+    let side_by_side = compute_side_by_side(
+        &diff.old_content,
+        &diff.new_content,
+        state.settings.tab_width,
+    );
+    let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+    let hunk_range = *hunks.get(hunk_index)?;
+    let (actual_hunk_start, actual_hunk_end) = hunk_change_bounds(&side_by_side, hunk_range)?;
+
+    let start_line = side_by_side
+        .get(actual_hunk_start)
+        .and_then(|dl| {
+            dl.new_line
+                .as_ref()
+                .map(|(n, _)| *n)
+                .or(dl.old_line.as_ref().map(|(n, _)| *n))
+        })
+        .unwrap_or(1);
+    let end_line = side_by_side
+        .get(actual_hunk_end)
+        .and_then(|dl| {
+            dl.new_line
+                .as_ref()
+                .map(|(n, _)| *n)
+                .or(dl.old_line.as_ref().map(|(n, _)| *n))
+        })
+        .unwrap_or(start_line);
+
+    Some((start_line, end_line))
+}
+
+fn hunk_matches_tag_filter(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    filter: Option<&TagFilter>,
+) -> bool {
+    match filter {
+        None => true,
+        Some(TagFilter::Tag(tag)) => state
+            .get_hunk_tags(file_index, hunk_index)
+            .map(|tags| tags.tags.iter().any(|t| t == tag))
+            .unwrap_or(false),
+        Some(TagFilter::Untagged) => state
+            .get_hunk_tags(file_index, hunk_index)
+            .map(|tags| tags.tags.is_empty())
+            .unwrap_or(true),
+    }
+}
+
+fn hunk_matches_review_filter(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    filter: ReviewFilter,
+) -> bool {
+    match filter {
+        ReviewFilter::All => true,
+        ReviewFilter::Reviewed => state.is_hunk_reviewed(file_index, hunk_index),
+        ReviewFilter::Unreviewed => !state.is_hunk_reviewed(file_index, hunk_index),
+    }
+}
+
+fn hunk_matches_filters(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    tag_filter: Option<&TagFilter>,
+    review_filter: ReviewFilter,
+) -> bool {
+    hunk_matches_tag_filter(state, file_index, hunk_index, tag_filter)
+        && hunk_matches_review_filter(state, file_index, hunk_index, review_filter)
+}
+
+fn matching_hunk_indices(
+    state: &AppState,
+    file_index: usize,
+    hunks: &[HunkRange],
+    tag_filter: Option<&TagFilter>,
+    review_filter: ReviewFilter,
+) -> Vec<usize> {
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| hunk_matches_filters(state, file_index, *idx, tag_filter, review_filter))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn matching_files_for_filters(
+    state: &AppState,
+    tag_filter: Option<&TagFilter>,
+    review_filter: ReviewFilter,
+) -> HashSet<usize> {
+    let mut files = HashSet::new();
+    for (idx, diff) in state.file_diffs.iter().enumerate() {
+        let side_by_side = compute_side_by_side(
+            &diff.old_content,
+            &diff.new_content,
+            state.settings.tab_width,
+        );
+        let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+        for hunk_idx in 0..hunks.len() {
+            if hunk_matches_filters(state, idx, hunk_idx, tag_filter, review_filter) {
+                files.insert(idx);
+                break;
+            }
+        }
+    }
+    files
+}
+
+fn apply_filters(state: &mut AppState) {
+    if state.tag_filter.is_none() && state.review_filter == ReviewFilter::All {
+        state.rebuild_sidebar_visible();
+        return;
+    }
+    let matching_files = matching_files_for_filters(state, state.tag_filter.as_ref(), state.review_filter);
+    state.rebuild_sidebar_visible_filtered(&matching_files);
+    if matching_files.contains(&state.current_file) {
+        return;
+    }
+    if let Some(file_index) = state.sidebar_visible.iter().find_map(|idx| {
+        if let SidebarItem::File { file_index, .. } = state.sidebar_items[*idx] {
+            Some(file_index)
+        } else {
+            None
+        }
+    }) {
+        state.select_file(file_index);
+    } else {
+        state.current_file = 0;
+        state.focused_hunk = None;
+    }
+}
+
+fn focus_first_matching_hunk(state: &mut AppState, visible_height: usize, max_scroll: usize) {
+    if let Some(diff) = state.file_diffs.get(state.current_file) {
+        let side_by_side =
+            compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+        let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+        let matching = matching_hunk_indices(
+            state,
+            state.current_file,
+            &hunks,
+            state.tag_filter.as_ref(),
+            state.review_filter,
+        );
+        if let Some(first) = matching.first().copied() {
+            state.focused_hunk = Some(first);
+            state.scroll = adjust_scroll_for_hunk(
+                hunks[first].start,
+                state.scroll,
+                visible_height,
+                max_scroll,
+            );
+        } else {
+            state.focused_hunk = None;
+        }
+    }
+}
+
+fn next_tag_filter(current: Option<&TagFilter>, tags: &[String]) -> Option<TagFilter> {
+    let mut sequence: Vec<TagFilter> = tags.iter().map(|t| TagFilter::Tag(t.clone())).collect();
+    sequence.push(TagFilter::Untagged);
+
+    match current {
+        None => sequence.first().cloned(),
+        Some(current_filter) => {
+            if let Some(pos) = sequence.iter().position(|f| f == current_filter) {
+                if pos + 1 < sequence.len() {
+                    Some(sequence[pos + 1].clone())
+                } else {
+                    None
+                }
+            } else {
+                sequence.first().cloned()
+            }
+        }
+    }
+}
+
+fn next_review_filter(current: ReviewFilter) -> ReviewFilter {
+    match current {
+        ReviewFilter::All => ReviewFilter::Reviewed,
+        ReviewFilter::Reviewed => ReviewFilter::Unreviewed,
+        ReviewFilter::Unreviewed => ReviewFilter::All,
+    }
+}
+
+fn annotation_json(annotation: &super::state::HunkAnnotation) -> Value {
+    let created_at = annotation
+        .created_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    serde_json::json!({
+        "id": annotation.id.clone(),
+        "file": annotation.filename.clone(),
+        "file_index": annotation.file_index,
+        "hunk_index": annotation.hunk_index,
+        "line_range": [annotation.line_range.0, annotation.line_range.1],
+        "content": annotation.content.clone(),
+        "created_at": created_at,
+    })
+}
+
+fn update_annotation_content(
+    state: &mut AppState,
+    id: &str,
+    content: String,
+) -> Option<super::state::HunkAnnotation> {
+    if let Some(existing) = state.annotations.iter_mut().find(|ann| ann.id == id) {
+        existing.content = content;
+        return Some(existing.clone());
+    }
+    None
+}
+
+fn remove_annotation_by_id(state: &mut AppState, id: &str) -> Option<super::state::HunkAnnotation> {
+    state
+        .annotations
+        .iter()
+        .position(|ann| ann.id == id)
+        .map(|index| state.annotations.remove(index))
+}
+
+fn handle_api_command(
+    command: ApiCommand,
+    state: &mut AppState,
+    current_scope: Option<&DiffScope>,
+    persistence: Option<&mut PersistenceManager>,
+    tag_manager: Option<&mut TagManager>,
+) {
+    match command {
+        ApiCommand::Status { respond_to } => {
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: status_json(state, current_scope),
+            });
+        }
+        ApiCommand::CurrentHunk { respond_to } => {
+            let response = if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(context) = build_hunk_context(state, file_index, hunk_index) {
+                    let display_range = context
+                        .new_line_range
+                        .or(context.old_line_range)
+                        .unwrap_or((0, 0));
+                    let annotation = state.get_annotation(file_index, hunk_index);
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [display_range.0, display_range.1],
+                            "old_line_range": context.old_line_range,
+                            "new_line_range": context.new_line_range,
+                            "diff_text": context.diff_text,
+                            "context_before": context.context_before,
+                            "context_changed": context.context_changed,
+                            "context_after": context.context_after,
+                            "change_type": context.change_type,
+                            "annotation": annotation.map(annotation_json),
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::CurrentFile { respond_to } => {
+            let response = if let Some(diff) = state.file_diffs.get(state.current_file) {
+                ApiResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "scope": scope_json(current_scope, state),
+                        "file": diff.filename.clone(),
+                        "file_index": state.current_file,
+                        "status": file_status_str(&diff.status),
+                        "is_binary": diff.is_binary,
+                        "old_content": diff.old_content.clone(),
+                        "new_content": diff.new_content.clone(),
+                    }),
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "file not found" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::FullContext { respond_to } => {
+            let current_hunk = if state.focused_hunk.is_some() {
+                if let Some(hunk_index) = state.focused_hunk {
+                    let file_index = state.current_file;
+                    build_hunk_context(state, file_index, hunk_index).map(|context| {
+                        let display_range = context
+                            .new_line_range
+                            .or(context.old_line_range)
+                            .unwrap_or((0, 0));
+                        serde_json::json!({
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [display_range.0, display_range.1],
+                            "old_line_range": context.old_line_range,
+                            "new_line_range": context.new_line_range,
+                            "diff_text": context.diff_text,
+                            "context_before": context.context_before,
+                            "context_changed": context.context_changed,
+                            "context_after": context.context_after,
+                            "change_type": context.change_type,
+                        })
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let annotations: Vec<Value> = state.annotations.iter().map(annotation_json).collect();
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "status": status_json(state, current_scope),
+                    "current_hunk": current_hunk,
+                    "annotations": annotations,
+                }),
+            });
+        }
+        ApiCommand::Annotations {
+            current_only,
+            respond_to,
+        } => {
+            let annotations: Vec<Value> = state
+                .annotations
+                .iter()
+                .filter(|ann| !current_only || ann.file_index == state.current_file)
+                .map(annotation_json)
+                .collect();
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "scope": scope_json(current_scope, state),
+                    "annotations": annotations,
+                }),
+            });
+        }
+        ApiCommand::CreateAnnotation {
+            content,
+            respond_to,
+        } => {
+            let response = if content.trim().is_empty() {
+                ApiResponse {
+                    status: 400,
+                    body: serde_json::json!({ "error": "content cannot be empty" }),
+                }
+            } else if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    let annotation = super::state::HunkAnnotation {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        file_index,
+                        hunk_index,
+                        content: content.clone(),
+                        line_range,
+                        filename: state.file_diffs[file_index].filename.clone(),
+                        created_at: std::time::SystemTime::now(),
+                    };
+                    state.set_annotation(annotation.clone());
+                    if let (Some(scope), Some(persistence)) = (current_scope, persistence) {
+                        if let Err(err) = persistence.upsert_annotation(state, &annotation, scope) {
+                            eprintln!("Warning: failed to persist annotation: {}", err);
+                        }
+                    }
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "annotation": annotation_json(&annotation),
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::UpdateAnnotation {
+            id,
+            content,
+            respond_to,
+        } => {
+            let response = if content.trim().is_empty() {
+                ApiResponse {
+                    status: 400,
+                    body: serde_json::json!({ "error": "content cannot be empty" }),
+                }
+            } else if let Some(annotation) = update_annotation_content(state, &id, content) {
+                if let (Some(scope), Some(persistence)) = (current_scope, persistence) {
+                    if let Err(err) = persistence.upsert_annotation(state, &annotation, scope) {
+                        eprintln!("Warning: failed to persist annotation: {}", err);
+                    }
+                }
+                ApiResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "scope": scope_json(current_scope, state),
+                        "annotation": annotation_json(&annotation),
+                    }),
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "annotation not found" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::DeleteAnnotation { id, respond_to } => {
+            let response = if let Some(annotation) = remove_annotation_by_id(state, &id) {
+                if let (Some(scope), Some(persistence)) = (current_scope, persistence) {
+                    if let Err(err) = persistence.remove_annotation(&annotation, scope) {
+                        eprintln!("Warning: failed to remove annotation: {}", err);
+                    }
+                }
+                ApiResponse {
+                    status: 200,
+                    body: serde_json::json!({
+                        "scope": scope_json(current_scope, state),
+                        "deleted": true,
+                        "annotation": annotation_json(&annotation),
+                    }),
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "annotation not found" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::TagsList { respond_to } => {
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "scope": scope_json(current_scope, state),
+                    "tags": state.tag_inventory,
+                }),
+            });
+        }
+        ApiCommand::TagsCurrent { respond_to } => {
+            let response = if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    let tags = state
+                        .get_hunk_tags(file_index, hunk_index)
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_default();
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [line_range.0, line_range.1],
+                            "tags": tags,
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::TagsSet { tags, respond_to } => {
+            let response = if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    if let (Some(scope), Some(tag_manager)) = (current_scope, tag_manager) {
+                        let tags = tags
+                            .into_iter()
+                            .map(|tag| tag.trim().to_string())
+                            .filter(|tag| !tag.is_empty())
+                            .collect::<Vec<String>>();
+                        if tags.is_empty() {
+                            state.remove_hunk_tags(file_index, hunk_index);
+                        } else if let Some(diff) = state.file_diffs.get(file_index) {
+                            state.set_hunk_tags(super::state::HunkTags {
+                                file_index,
+                                hunk_index,
+                                filename: diff.filename.clone(),
+                                tags: tags.clone(),
+                            });
+                        }
+                        if let Err(err) = tag_manager.set_hunk_tags(
+                            &state,
+                            file_index,
+                            hunk_index,
+                            tags.clone(),
+                            scope,
+                        ) {
+                            ApiResponse {
+                                status: 500,
+                                body: serde_json::json!({ "error": err.to_string() }),
+                            }
+                        } else {
+                            state.tag_inventory = tag_manager.tags().to_vec();
+                            ApiResponse {
+                                status: 200,
+                                body: serde_json::json!({
+                                    "scope": scope_json(current_scope, state),
+                                    "file": state.file_diffs[file_index].filename.clone(),
+                                    "file_index": file_index,
+                                    "hunk_index": hunk_index,
+                                    "line_range": [line_range.0, line_range.1],
+                                    "tags": tags,
+                                }),
+                            }
+                        }
+                    } else {
+                        ApiResponse {
+                            status: 503,
+                            body: serde_json::json!({ "error": "tag storage unavailable" }),
+                        }
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+    }
+}
+
+fn resolve_working_base_commit(backend: &dyn VcsBackend) -> Option<String> {
+    let base_ref = backend.working_copy_parent_ref();
+    backend.resolve_ref(base_ref).ok()
+}
+
+fn resolve_commit_id_from_options(
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> Option<String> {
+    match &options.reference {
+        Some(CommitReference::Single(reference)) => backend.resolve_ref(reference).ok(),
+        Some(CommitReference::Range { to, .. }) => backend.resolve_ref(to).ok(),
+        Some(CommitReference::TripleDots { to, .. }) => backend.resolve_ref(to).ok(),
+        None => None,
+    }
+}
+
+fn determine_scope(
+    state: &AppState,
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> Option<DiffScope> {
+    if state.stacked_mode {
+        if let Some(commit) = state.current_commit() {
+            return Some(DiffScope::Commit {
+                commit_id: commit.commit_id.clone(),
+            });
+        }
+        return None;
+    }
+
+    if let Some(commit_id) = resolve_commit_id_from_options(options, backend) {
+        return Some(DiffScope::Commit { commit_id });
+    }
+
+    resolve_working_base_commit(backend)
+        .map(|base_commit_id| DiffScope::WorkingTree { base_commit_id })
+}
+
+fn load_persistence_for_state(
+    persistence: &mut PersistenceManager,
+    view_state: Option<&mut ViewStateManager>,
+    tag_manager: Option<&mut TagManager>,
+    review_manager: Option<&ReviewManager>,
+    state: &mut AppState,
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> Option<DiffScope> {
+    let scope = determine_scope(state, options, backend)?;
+    if let Err(err) = persistence.load_for_scope(state, &scope) {
+        eprintln!("Warning: failed to load annotations: {}", err);
+    }
+    if let Some(view_state) = view_state {
+        if let Err(err) = view_state.load_for_scope(state, &scope) {
+            eprintln!("Warning: failed to load view state: {}", err);
+        }
+    }
+    if let Some(tag_manager) = tag_manager {
+        if let Err(err) = tag_manager.load_for_scope(state, &scope) {
+            eprintln!("Warning: failed to load tags: {}", err);
+        }
+    }
+    if let Some(review_manager) = review_manager {
+        if let Err(err) = review_manager.load_for_scope(state, &scope) {
+            eprintln!("Warning: failed to load reviewed hunks: {}", err);
+        }
+    }
+    Some(scope)
+}
+
+fn save_view_state_for_scope(
+    view_state: Option<&mut ViewStateManager>,
+    state: &AppState,
+    scope: Option<&DiffScope>,
+) {
+    if let (Some(view_state), Some(scope)) = (view_state, scope) {
+        if let Err(err) = view_state.save_for_scope(state, scope) {
+            eprintln!("Warning: failed to save view state: {}", err);
+        }
+    }
 }
 
 pub fn run_app_with_pr(
@@ -152,12 +1036,19 @@ fn run_app_internal(
         None
     };
 
-    let mut state = AppState::new(file_diffs);
+    let settings = super::types::DiffViewSettings {
+        unified_context: options.unified_context,
+        ..super::types::DiffViewSettings::default()
+    };
+    let mut state = AppState::new(file_diffs, settings);
     state.set_vcs_name(backend.name());
 
     // Set diff reference for annotation export context
     let diff_ref_str = if let Some(pr) = &pr_info {
-        Some(format!("PR #{} ({}...{})", pr.number, pr.base_ref, pr.head_ref))
+        Some(format!(
+            "PR #{} ({}...{})",
+            pr.number, pr.base_ref, pr.head_ref
+        ))
     } else {
         options.reference.as_ref().map(|r| match r {
             CommitReference::Single(s) => s.clone(),
@@ -169,12 +1060,66 @@ fn run_app_internal(
 
     let mut active_modal: Option<Modal> = None;
     let mut annotation_editor: Option<AnnotationEditor> = None;
+    let mut tag_editor: Option<TagEditor> = None;
     let mut pending_watch_event: Option<WatchEvent> = None;
     let mut pending_events: VecDeque<Event> = VecDeque::new();
+    let mut api_rx: Option<mpsc::Receiver<ApiCommand>> = None;
+    let _api_handle = if options.api.enabled {
+        let (tx, rx) = mpsc::channel();
+        api_rx = Some(rx);
+        match start_api_server(&options.api.bind, tx) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                eprintln!("Warning: failed to start API server: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Initialize stacked mode if commits were provided
     if let Some(commits) = stacked_commits {
         state.init_stacked_mode(commits);
+    }
+
+    let mut persistence = if pr_info.is_some() {
+        None
+    } else {
+        PersistenceManager::try_new()?
+    };
+    let mut tag_manager = TagManager::try_new()?;
+    let review_manager = ReviewManager::try_new()?;
+    let mut view_state = if pr_info.is_some() {
+        None
+    } else {
+        ViewStateManager::try_new()?
+    };
+    let mut current_scope = None;
+    if let Some(ref mut persistence) = persistence {
+        current_scope = load_persistence_for_state(
+            persistence,
+            view_state.as_mut(),
+            tag_manager.as_mut(),
+            review_manager.as_ref(),
+            &mut state,
+            &options,
+            backend,
+        );
+    } else {
+        current_scope = determine_scope(&state, &options, backend);
+        if let Some(ref scope) = current_scope {
+            if let Some(ref mut tag_manager) = tag_manager {
+                if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
+                    eprintln!("Warning: failed to load tags: {}", err);
+                }
+            }
+            if let Some(ref review_manager) = review_manager {
+                if let Err(err) = review_manager.load_for_scope(&mut state, scope) {
+                    eprintln!("Warning: failed to load reviewed hunks: {}", err);
+                }
+            }
+        }
     }
 
     // Load viewed files from GitHub on startup in PR mode
@@ -183,6 +1128,18 @@ fn run_app_internal(
     }
 
     'main: loop {
+        if let Some(ref api_rx) = api_rx {
+            while let Ok(command) = api_rx.try_recv() {
+                handle_api_command(
+                    command,
+                    &mut state,
+                    current_scope.as_ref(),
+                    persistence.as_mut(),
+                    tag_manager.as_mut(),
+                );
+            }
+        }
+
         if let Some(ref rx) = watch_rx {
             match rx.try_recv() {
                 Ok(event) => {
@@ -216,9 +1173,16 @@ fn run_app_internal(
             if let Some(ref pr) = pr_info {
                 sync_viewed_files_from_github(pr, &mut state);
             }
+            apply_filters(&mut state);
         }
 
-        if state.file_diffs.is_empty() {
+        let has_visible_files = if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All {
+            !state.sidebar_visible.is_empty()
+        } else {
+            !state.file_diffs.is_empty()
+        };
+
+        if !has_visible_files {
             terminal.draw(|frame| {
                 render_empty_state(frame, options.watch);
                 if let Some(ref modal) = active_modal {
@@ -232,16 +1196,49 @@ fn run_app_internal(
                 &diff.new_content,
                 state.settings.tab_width,
             );
-            let hunks = find_hunk_starts(&side_by_side);
-            let hunk_count = hunks.len();
+            let hunk_ranges = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+            let matching_hunks = matching_hunk_indices(
+                &state,
+                state.current_file,
+                &hunk_ranges,
+                state.tag_filter.as_ref(),
+                state.review_filter,
+            );
+            let hunk_count = matching_hunks.len();
+            let footer_focused_hunk = state
+                .focused_hunk
+                .and_then(|idx| matching_hunks.iter().position(|hunk| *hunk == idx));
+            let tag_filter_label = state.tag_filter.as_ref().map(|filter| match filter {
+                TagFilter::Tag(tag) => format!("tag: {}", tag),
+                TagFilter::Untagged => "tag: untagged".to_string(),
+            });
+            let review_filter_label = match state.review_filter {
+                ReviewFilter::Reviewed => Some("review: reviewed".to_string()),
+                ReviewFilter::Unreviewed => Some("review: unreviewed".to_string()),
+                ReviewFilter::All => None,
+            };
+            let focused_tags = state
+                .focused_hunk
+                .and_then(|idx| state.get_hunk_tags(state.current_file, idx))
+                .and_then(|tags| {
+                    if tags.tags.is_empty() {
+                        None
+                    } else {
+                        Some(tags.tags.join(", "))
+                    }
+                });
+            let focused_review_label = state.focused_hunk.map(|idx| {
+                if state.is_hunk_reviewed(state.current_file, idx) {
+                    "reviewed".to_string()
+                } else {
+                    "unreviewed".to_string()
+                }
+            });
             state
                 .search_state
                 .update_matches(&side_by_side, state.diff_fullscreen);
             let branch_fallback = get_current_branch(backend);
-            let commit_ref = state
-                .diff_reference
-                .as_deref()
-                .unwrap_or(&branch_fallback);
+            let commit_ref = state.diff_reference.as_deref().unwrap_or(&branch_fallback);
             terminal.draw(|frame| {
                 render_diff(
                     frame,
@@ -267,7 +1264,12 @@ fn run_app_internal(
                     commit_ref,
                     pr_info.as_ref(),
                     state.focused_hunk,
-                    &hunks,
+                    &hunk_ranges,
+                    footer_focused_hunk,
+                    tag_filter_label,
+                    review_filter_label,
+                    focused_tags,
+                    focused_review_label,
                     state.stacked_mode,
                     state.current_commit(),
                     state.current_commit_index,
@@ -277,6 +1279,9 @@ fn run_app_internal(
                 );
                 // Render annotation editor (on top of everything except modal)
                 if let Some(ref editor) = annotation_editor {
+                    editor.render(frame);
+                }
+                if let Some(ref editor) = tag_editor {
                     editor.render(frame);
                 }
                 if let Some(ref modal) = active_modal {
@@ -337,6 +1342,55 @@ fn run_app_internal(
                 }
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
+                        && tag_editor.is_some()
+                        && active_modal.is_none() =>
+                {
+                    if let Some(editor) = tag_editor.as_mut() {
+                        match editor.handle_input(key) {
+                            TagEditorResult::Continue => {}
+                            TagEditorResult::Save(tags) => {
+                                let file_index = editor.file_index;
+                                let hunk_index = editor.hunk_index;
+                                if let Some(diff) = state.file_diffs.get(file_index) {
+                                    if tags.is_empty() {
+                                        state.remove_hunk_tags(file_index, hunk_index);
+                                    } else {
+                                        state.set_hunk_tags(super::state::HunkTags {
+                                            file_index,
+                                            hunk_index,
+                                            filename: diff.filename.clone(),
+                                            tags: tags.clone(),
+                                        });
+                                    }
+                                    if let (Some(ref mut tag_manager), Some(scope)) =
+                                        (tag_manager.as_mut(), current_scope.as_ref())
+                                    {
+                                        if let Err(err) = tag_manager.set_hunk_tags(
+                                            &state,
+                                            file_index,
+                                            hunk_index,
+                                            tags,
+                                            scope,
+                                        ) {
+                                            eprintln!(
+                                                "Warning: failed to persist tags: {}",
+                                                err
+                                            );
+                                        }
+                                        state.tag_inventory = tag_manager.tags().to_vec();
+                                    }
+                                }
+                                apply_filters(&mut state);
+                                tag_editor = None;
+                            }
+                            TagEditorResult::Cancel => {
+                                tag_editor = None;
+                            }
+                        }
+                    }
+                }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
                         && annotation_editor.is_some()
                         && active_modal.is_none() =>
                 {
@@ -344,11 +1398,38 @@ fn run_app_internal(
                         match editor.handle_input(key) {
                             AnnotationEditorResult::Continue => {}
                             AnnotationEditorResult::Save => {
-                                state.set_annotation(editor.to_annotation());
+                                let annotation = editor.to_annotation();
+                                state.set_annotation(annotation.clone());
+                                if let (Some(ref mut persistence), Some(scope)) =
+                                    (persistence.as_mut(), current_scope.as_ref())
+                                {
+                                    if let Err(err) =
+                                        persistence.upsert_annotation(&state, &annotation, scope)
+                                    {
+                                        eprintln!("Warning: failed to save annotation: {}", err);
+                                    }
+                                }
                                 annotation_editor = None;
                             }
                             AnnotationEditorResult::Delete => {
-                                state.remove_annotation(editor.file_index, editor.hunk_index);
+                                if let Some(existing) = state
+                                    .get_annotation(editor.file_index, editor.hunk_index)
+                                    .cloned()
+                                {
+                                    state.remove_annotation(editor.file_index, editor.hunk_index);
+                                    if let (Some(ref mut persistence), Some(scope)) =
+                                        (persistence.as_mut(), current_scope.as_ref())
+                                    {
+                                        if let Err(err) =
+                                            persistence.remove_annotation(&existing, scope)
+                                        {
+                                            eprintln!(
+                                                "Warning: failed to remove annotation: {}",
+                                                err
+                                            );
+                                        }
+                                    }
+                                }
                                 annotation_editor = None;
                             }
                             AnnotationEditorResult::Cancel => {
@@ -365,6 +1446,9 @@ fn run_app_internal(
                                 ModalResult::FileSelected(file_index) => {
                                     state.reveal_file(file_index);
                                     state.select_file(file_index);
+                                    if state.tag_filter.is_some() {
+                                        apply_filters(&mut state);
+                                    }
                                     if let Some(idx) =
                                         state.sidebar_visible_index_for_file(state.current_file)
                                     {
@@ -375,7 +1459,10 @@ fn run_app_internal(
                                     }
                                     active_modal = None;
                                 }
-                                ModalResult::AnnotationJump { file_index, hunk_index } => {
+                                ModalResult::AnnotationJump {
+                                    file_index,
+                                    hunk_index,
+                                } => {
                                     // Jump to the file and hunk
                                     state.select_file(file_index);
                                     state.focused_hunk = Some(hunk_index);
@@ -386,10 +1473,13 @@ fn run_app_internal(
                                         &diff.new_content,
                                         state.settings.tab_width,
                                     );
-                                    let hunks = find_hunk_starts(&side_by_side);
-                                    if let Some(&hunk_start) = hunks.get(hunk_index) {
+                                    let hunks = find_hunk_ranges(
+                                        &side_by_side,
+                                        state.settings.unified_context,
+                                    );
+                                    if let Some(hunk) = hunks.get(hunk_index) {
                                         state.scroll = adjust_scroll_for_hunk(
-                                            hunk_start,
+                                            hunk.start,
                                             state.scroll,
                                             visible_height,
                                             max_scroll,
@@ -397,15 +1487,20 @@ fn run_app_internal(
                                     }
                                     active_modal = None;
                                 }
-                                ModalResult::AnnotationEdit { file_index, hunk_index } => {
+                                ModalResult::AnnotationEdit {
+                                    file_index,
+                                    hunk_index,
+                                } => {
                                     // Close modal and open annotation editor for editing
-                                    if let Some(ann) = state.get_annotation(file_index, hunk_index) {
+                                    if let Some(ann) = state.get_annotation(file_index, hunk_index)
+                                    {
                                         let editor = AnnotationEditor::new(
                                             file_index,
                                             hunk_index,
                                             ann.filename.clone(),
                                             ann.line_range,
-                                        ).with_content(&ann.content, ann.created_at);
+                                        )
+                                        .with_content(&ann.content, ann.created_at, ann.id.clone());
                                         annotation_editor = Some(editor);
                                         // Also jump to the hunk
                                         state.select_file(file_index);
@@ -413,8 +1508,27 @@ fn run_app_internal(
                                     }
                                     active_modal = None;
                                 }
-                                ModalResult::AnnotationDelete { file_index, hunk_index } => {
-                                    state.remove_annotation(file_index, hunk_index);
+                                ModalResult::AnnotationDelete {
+                                    file_index,
+                                    hunk_index,
+                                } => {
+                                    if let Some(existing) =
+                                        state.get_annotation(file_index, hunk_index).cloned()
+                                    {
+                                        state.remove_annotation(file_index, hunk_index);
+                                        if let (Some(ref mut persistence), Some(scope)) =
+                                            (persistence.as_mut(), current_scope.as_ref())
+                                        {
+                                            if let Err(err) =
+                                                persistence.remove_annotation(&existing, scope)
+                                            {
+                                                eprintln!(
+                                                    "Warning: failed to remove annotation: {}",
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    }
                                     // Refresh the modal if there are still annotations
                                     if !state.annotations.is_empty() {
                                         let mut sorted_annotations = state.annotations.clone();
@@ -423,7 +1537,11 @@ fn run_app_internal(
                                             .iter()
                                             .map(format_annotation_preview)
                                             .collect();
-                                        active_modal = Some(Modal::annotations("Annotations", items, sorted_annotations));
+                                        active_modal = Some(Modal::annotations(
+                                            "Annotations",
+                                            items,
+                                            sorted_annotations,
+                                        ));
                                     } else {
                                         active_modal = None;
                                     }
@@ -446,8 +1564,14 @@ fn run_app_internal(
                                         Err(e) => {
                                             // Set error message on the modal
                                             if let Some(ref mut modal) = active_modal {
-                                                if let ModalContent::Annotations { error_message, export_input, .. } = &mut modal.content {
-                                                    *error_message = Some(format!("Failed to write: {}", e));
+                                                if let ModalContent::Annotations {
+                                                    error_message,
+                                                    export_input,
+                                                    ..
+                                                } = &mut modal.content
+                                                {
+                                                    *error_message =
+                                                        Some(format!("Failed to write: {}", e));
                                                     *export_input = None; // Close input, keep modal open
                                                 }
                                             }
@@ -480,7 +1604,22 @@ fn run_app_internal(
                                 // Left arrow click (first 4 columns to cover " < ")
                                 if mouse.column < 4 && state.current_commit_index > 0 {
                                     let new_index = state.current_commit_index - 1;
-                                    navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                    if navigate_stacked_commit(
+                                        &mut state, new_index, &options, backend,
+                                    ) {
+                                        if let Some(ref mut persistence) = persistence {
+                                            current_scope = load_persistence_for_state(
+                                                persistence,
+                                                view_state.as_mut(),
+                                                tag_manager.as_mut(),
+                                                review_manager.as_ref(),
+                                                &mut state,
+                                                &options,
+                                                backend,
+                                            );
+                                            apply_filters(&mut state);
+                                        }
+                                    }
                                 }
                                 // Right arrow click (last 4 columns to cover " > ")
                                 else if mouse.column >= term_size.width.saturating_sub(4)
@@ -488,7 +1627,22 @@ fn run_app_internal(
                                         < state.stacked_commits.len().saturating_sub(1)
                                 {
                                     let new_index = state.current_commit_index + 1;
-                                    navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                    if navigate_stacked_commit(
+                                        &mut state, new_index, &options, backend,
+                                    ) {
+                                        if let Some(ref mut persistence) = persistence {
+                                            current_scope = load_persistence_for_state(
+                                                persistence,
+                                                view_state.as_mut(),
+                                                tag_manager.as_mut(),
+                                                review_manager.as_ref(),
+                                                &mut state,
+                                                &options,
+                                                backend,
+                                            );
+                                            apply_filters(&mut state);
+                                        }
+                                    }
                                 }
                             } else if state.show_sidebar
                                 && mouse.column < sidebar_width
@@ -604,8 +1758,20 @@ fn run_app_internal(
                         {
                             state.search_state.clear();
                         }
-                        KeyCode::Char('q') | KeyCode::Esc => break 'main,
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
+                            break 'main
+                        }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
                             break 'main
                         }
                         KeyCode::Char('1') => {
@@ -674,14 +1840,42 @@ fn run_app_internal(
                                 && state.current_commit_index < state.stacked_commits.len() - 1
                             {
                                 let new_index = state.current_commit_index + 1;
-                                navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                if navigate_stacked_commit(&mut state, new_index, &options, backend)
+                                {
+                                    if let Some(ref mut persistence) = persistence {
+                                        current_scope = load_persistence_for_state(
+                                            persistence,
+                                            view_state.as_mut(),
+                                            tag_manager.as_mut(),
+                                            review_manager.as_ref(),
+                                            &mut state,
+                                            &options,
+                                            backend,
+                                        );
+                                        apply_filters(&mut state);
+                                    }
+                                }
                             }
                         }
                         // Stacked mode: navigate to previous commit
                         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if state.stacked_mode && state.current_commit_index > 0 {
                                 let new_index = state.current_commit_index - 1;
-                                navigate_stacked_commit(&mut state, new_index, &options, backend);
+                                if navigate_stacked_commit(&mut state, new_index, &options, backend)
+                                {
+                                    if let Some(ref mut persistence) = persistence {
+                                        current_scope = load_persistence_for_state(
+                                            persistence,
+                                            view_state.as_mut(),
+                                            tag_manager.as_mut(),
+                                            review_manager.as_ref(),
+                                            &mut state,
+                                            &options,
+                                            backend,
+                                        );
+                                        apply_filters(&mut state);
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -818,6 +2012,12 @@ fn run_app_internal(
                                         }
                                         SidebarItem::Directory { path, .. } => {
                                             state.toggle_directory(&path);
+                                            if state.tag_filter.is_some() {
+                                                apply_filters(&mut state);
+                                            }
+                                            if state.tag_filter.is_some() {
+                                                apply_filters(&mut state);
+                                            }
                                             let visible_height =
                                                 terminal.size()?.height.saturating_sub(5) as usize;
                                             if state.sidebar_selected < state.sidebar_scroll {
@@ -836,6 +2036,7 @@ fn run_app_internal(
                             }
                         }
                         KeyCode::Char(' ') => {
+                            let mut should_save_view_state = false;
                             if state.focused_panel == FocusedPanel::Sidebar
                                 && state.sidebar_selected < state.sidebar_visible_len()
                             {
@@ -856,6 +2057,7 @@ fn run_app_internal(
                                             } else {
                                                 state.viewed_files.insert(file_idx);
                                             }
+                                            should_save_view_state = true;
 
                                             // Fire off async API call if in PR mode
                                             if let Some(ref pr) = pr_info {
@@ -900,6 +2102,7 @@ fn run_app_internal(
                                                     state.viewed_files.insert(*idx);
                                                 }
                                             }
+                                            should_save_view_state = true;
 
                                             // Fire off async API calls if in PR mode
                                             if let Some(ref pr) = pr_info {
@@ -967,6 +2170,7 @@ fn run_app_internal(
                                         ensure_sidebar_visible(&mut state, visible_height);
                                     }
                                 }
+                                should_save_view_state = true;
 
                                 // Fire off async API call if in PR mode
                                 if let Some(ref pr) = pr_info {
@@ -976,6 +2180,13 @@ fn run_app_internal(
                                         mark_file_as_viewed_async(pr, &filename);
                                     }
                                 }
+                            }
+                            if should_save_view_state {
+                                save_view_state_for_scope(
+                                    view_state.as_mut(),
+                                    &state,
+                                    current_scope.as_ref(),
+                                );
                             }
                         }
                         KeyCode::PageDown => {
@@ -992,24 +2203,43 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_starts(&side_by_side);
-                                let current_hunk = state.focused_hunk.unwrap_or(0);
-                                let next_hunk = if state.focused_hunk.is_none() {
-                                    hunks
-                                        .iter()
-                                        .position(|&h| h > state.scroll as usize + 5)
-                                        .unwrap_or(0)
-                                } else {
-                                    (current_hunk + 1).min(hunks.len().saturating_sub(1))
-                                };
-                                if !hunks.is_empty() {
+                                let hunks =
+                                    find_hunk_ranges(&side_by_side, state.settings.unified_context);
+                                let matching = matching_hunk_indices(
+                                    &state,
+                                    state.current_file,
+                                    &hunks,
+                                    state.tag_filter.as_ref(),
+                                    state.review_filter,
+                                );
+                                if !matching.is_empty() {
+                                    let current_pos = state.focused_hunk.and_then(|idx| {
+                                        matching.iter().position(|hunk| *hunk == idx)
+                                    });
+                                    let next_hunk = if let Some(pos) = current_pos {
+                                        if pos + 1 < matching.len() {
+                                            matching[pos + 1]
+                                        } else {
+                                            matching[pos]
+                                        }
+                                    } else {
+                                        matching
+                                            .iter()
+                                            .copied()
+                                            .find(|idx| {
+                                                hunks[*idx].start > state.scroll as usize + 5
+                                            })
+                                            .unwrap_or(matching[0])
+                                    };
                                     state.focused_hunk = Some(next_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
-                                        hunks[next_hunk],
+                                        hunks[next_hunk].start,
                                         state.scroll,
                                         visible_height,
                                         max_scroll,
                                     );
+                                } else {
+                                    state.focused_hunk = None;
                                 }
                             }
                         }
@@ -1021,24 +2251,44 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_starts(&side_by_side);
-                                let current_hunk = state.focused_hunk.unwrap_or(hunks.len());
-                                let prev_hunk = if state.focused_hunk.is_none() {
-                                    hunks
-                                        .iter()
-                                        .rposition(|&h| (h as u16) < state.scroll.saturating_sub(5))
-                                        .unwrap_or(hunks.len().saturating_sub(1))
-                                } else {
-                                    current_hunk.saturating_sub(1)
-                                };
-                                if !hunks.is_empty() {
+                                let hunks =
+                                    find_hunk_ranges(&side_by_side, state.settings.unified_context);
+                                let matching = matching_hunk_indices(
+                                    &state,
+                                    state.current_file,
+                                    &hunks,
+                                    state.tag_filter.as_ref(),
+                                    state.review_filter,
+                                );
+                                if !matching.is_empty() {
+                                    let current_pos = state.focused_hunk.and_then(|idx| {
+                                        matching.iter().position(|hunk| *hunk == idx)
+                                    });
+                                    let prev_hunk = if let Some(pos) = current_pos {
+                                        if pos > 0 {
+                                            matching[pos - 1]
+                                        } else {
+                                            matching[pos]
+                                        }
+                                    } else {
+                                        matching
+                                            .iter()
+                                            .copied()
+                                            .rfind(|idx| {
+                                                (hunks[*idx].start as u16)
+                                                    < state.scroll.saturating_sub(5)
+                                            })
+                                            .unwrap_or(matching[matching.len() - 1])
+                                    };
                                     state.focused_hunk = Some(prev_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
-                                        hunks[prev_hunk],
+                                        hunks[prev_hunk].start,
                                         state.scroll,
                                         visible_height,
                                         max_scroll,
                                     );
+                                } else {
+                                    state.focused_hunk = None;
                                 }
                             }
                         }
@@ -1054,57 +2304,123 @@ fn run_app_internal(
                                     &diff.new_content,
                                     state.settings.tab_width,
                                 );
-                                let hunks = find_hunk_starts(&side_by_side);
-                                let hunk_start = hunks.get(hunk_index).copied().unwrap_or(0);
-                                let next_hunk_start = hunks
-                                    .get(hunk_index + 1)
-                                    .copied()
-                                    .unwrap_or(side_by_side.len());
+                                let hunks =
+                                    find_hunk_ranges(&side_by_side, state.settings.unified_context);
+                                if let Some(hunk_range) = hunks.get(hunk_index) {
+                                    if let Some((actual_hunk_start, actual_hunk_end)) =
+                                        hunk_change_bounds(&side_by_side, *hunk_range)
+                                    {
+                                        let start_line = side_by_side
+                                            .get(actual_hunk_start)
+                                            .and_then(|dl| {
+                                                dl.new_line
+                                                    .as_ref()
+                                                    .map(|(n, _)| *n)
+                                                    .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                            })
+                                            .unwrap_or(1);
+                                        let end_line = side_by_side
+                                            .get(actual_hunk_end)
+                                            .and_then(|dl| {
+                                                dl.new_line
+                                                    .as_ref()
+                                                    .map(|(n, _)| *n)
+                                                    .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                            })
+                                            .unwrap_or(start_line);
 
-                                // Find the actual end of the hunk (last changed line, not start of next hunk)
-                                let mut actual_hunk_end = hunk_start;
-                                for i in hunk_start..next_hunk_start {
-                                    if let Some(dl) = side_by_side.get(i) {
-                                        if !matches!(dl.change_type, ChangeType::Equal) {
-                                            actual_hunk_end = i;
+                                        let editor = AnnotationEditor::new(
+                                            file_index,
+                                            hunk_index,
+                                            diff.filename.clone(),
+                                            (start_line, end_line),
+                                        );
+
+                                        // If editing existing, pre-fill content
+                                        let editor = if let Some(ann) =
+                                            state.get_annotation(file_index, hunk_index)
+                                        {
+                                            editor.with_content(
+                                                &ann.content,
+                                                ann.created_at,
+                                                ann.id.clone(),
+                                            )
+                                        } else {
+                                            editor
+                                        };
+
+                                        annotation_editor = Some(editor);
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('v') => {
+                            if let Some(hunk_index) = state.focused_hunk {
+                                let file_index = state.current_file;
+                                let reviewed = !state.is_hunk_reviewed(file_index, hunk_index);
+                                if let Some(diff) = state.file_diffs.get(file_index) {
+                                    if reviewed {
+                                        state.set_hunk_reviewed(super::state::HunkReview {
+                                            file_index,
+                                            hunk_index,
+                                            filename: diff.filename.clone(),
+                                        });
+                                    } else {
+                                        state.remove_hunk_reviewed(file_index, hunk_index);
+                                    }
+                                    if let (Some(ref review_manager), Some(scope)) =
+                                        (review_manager.as_ref(), current_scope.as_ref())
+                                    {
+                                        if let Err(err) = review_manager.set_hunk_reviewed(
+                                            &state,
+                                            file_index,
+                                            hunk_index,
+                                            reviewed,
+                                            scope,
+                                        ) {
+                                            eprintln!(
+                                                "Warning: failed to persist reviewed hunk: {}",
+                                                err
+                                            );
+                                        }
+                                    }
+                                    if state.tag_filter.is_some()
+                                        || state.review_filter != ReviewFilter::All
+                                    {
+                                        apply_filters(&mut state);
+                                        focus_first_matching_hunk(
+                                            &mut state,
+                                            visible_height,
+                                            max_scroll,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('t') => {
+                            if tag_editor.is_none() {
+                                if let Some(hunk_index) = state.focused_hunk {
+                                    let file_index = state.current_file;
+                                    if let Some(line_range) =
+                                        compute_hunk_line_range(&state, file_index, hunk_index)
+                                    {
+                                        if let Some(diff) = state.file_diffs.get(file_index) {
+                                            let existing_tags = state
+                                                .get_hunk_tags(file_index, hunk_index)
+                                                .map(|tags| tags.tags.clone())
+                                                .unwrap_or_default();
+                                            let editor = TagEditor::new(
+                                                file_index,
+                                                hunk_index,
+                                                diff.filename.clone(),
+                                                line_range,
+                                                existing_tags,
+                                                state.tag_inventory.clone(),
+                                            );
+                                            tag_editor = Some(editor);
                                         }
                                     }
                                 }
-
-                                let start_line = side_by_side
-                                    .get(hunk_start)
-                                    .and_then(|dl| {
-                                        dl.new_line
-                                            .as_ref()
-                                            .map(|(n, _)| *n)
-                                            .or(dl.old_line.as_ref().map(|(n, _)| *n))
-                                    })
-                                    .unwrap_or(1);
-                                let end_line = side_by_side
-                                    .get(actual_hunk_end)
-                                    .and_then(|dl| {
-                                        dl.new_line
-                                            .as_ref()
-                                            .map(|(n, _)| *n)
-                                            .or(dl.old_line.as_ref().map(|(n, _)| *n))
-                                    })
-                                    .unwrap_or(start_line);
-
-                                let editor = AnnotationEditor::new(
-                                    file_index,
-                                    hunk_index,
-                                    diff.filename.clone(),
-                                    (start_line, end_line),
-                                );
-
-                                // If editing existing, pre-fill content
-                                let editor = if let Some(ann) = state.get_annotation(file_index, hunk_index) {
-                                    editor.with_content(&ann.content, ann.created_at)
-                                } else {
-                                    editor
-                                };
-
-                                annotation_editor = Some(editor);
                             }
                         }
                         KeyCode::Char('I') => {
@@ -1116,8 +2432,35 @@ fn run_app_internal(
                                     .iter()
                                     .map(format_annotation_preview)
                                     .collect();
-                                active_modal = Some(Modal::annotations("Annotations", items, sorted_annotations));
+                                active_modal = Some(Modal::annotations(
+                                    "Annotations",
+                                    items,
+                                    sorted_annotations,
+                                ));
                             }
+                        }
+                        KeyCode::Char('T') => {
+                            let next_filter =
+                                next_tag_filter(state.tag_filter.as_ref(), &state.tag_inventory);
+                            state.tag_filter = next_filter;
+                            apply_filters(&mut state);
+                            if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All
+                            {
+                                focus_first_matching_hunk(&mut state, visible_height, max_scroll);
+                            }
+                        }
+                        KeyCode::Char('V') => {
+                            state.review_filter = next_review_filter(state.review_filter);
+                            apply_filters(&mut state);
+                            if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All
+                            {
+                                focus_first_matching_hunk(&mut state, visible_height, max_scroll);
+                            }
+                        }
+                        KeyCode::Char('C') => {
+                            state.tag_filter = None;
+                            state.review_filter = ReviewFilter::All;
+                            apply_filters(&mut state);
                         }
                         KeyCode::Char('r') => {
                             state.needs_reload = true;
@@ -1147,14 +2490,19 @@ fn run_app_internal(
                                         &diff.new_content,
                                         state.settings.tab_width,
                                     );
-                                    let hunks = find_hunk_starts(&side_by_side);
-                                    if let Some(&hunk_start) = hunks.get(hunk_idx) {
-                                        side_by_side.get(hunk_start).and_then(|dl| {
-                                            dl.new_line
-                                                .as_ref()
-                                                .map(|(n, _)| *n)
-                                                .or(dl.old_line.as_ref().map(|(n, _)| *n))
-                                        })
+                                    let hunks = find_hunk_ranges(
+                                        &side_by_side,
+                                        state.settings.unified_context,
+                                    );
+                                    if let Some(hunk) = hunks.get(hunk_idx) {
+                                        hunk_change_bounds(&side_by_side, *hunk)
+                                            .and_then(|(start, _)| side_by_side.get(start))
+                                            .and_then(|dl| {
+                                                dl.new_line
+                                                    .as_ref()
+                                                    .map(|(n, _)| *n)
+                                                    .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                            })
                                     } else {
                                         None
                                     }
@@ -1300,7 +2648,8 @@ fn run_app_internal(
                                             },
                                             KeyBind {
                                                 key: "enter",
-                                                description: "Open file in diff view / toggle directory",
+                                                description:
+                                                    "Open file in diff view / toggle directory",
                                             },
                                             KeyBind {
                                                 key: "space",
@@ -1380,6 +2729,36 @@ fn run_app_internal(
                                             KeyBind {
                                                 key: "I",
                                                 description: "View all annotations",
+                                            },
+                                        ],
+                                    },
+                                    KeyBindSection {
+                                        title: "Tags",
+                                        bindings: vec![
+                                            KeyBind {
+                                                key: "t",
+                                                description: "Tag focused hunk",
+                                            },
+                                            KeyBind {
+                                                key: "T",
+                                                description: "Cycle tag filter",
+                                            },
+                                        ],
+                                    },
+                                    KeyBindSection {
+                                        title: "Review",
+                                        bindings: vec![
+                                            KeyBind {
+                                                key: "v",
+                                                description: "Toggle hunk reviewed",
+                                            },
+                                            KeyBind {
+                                                key: "V",
+                                                description: "Cycle review filter",
+                                            },
+                                            KeyBind {
+                                                key: "C",
+                                                description: "Clear all filters",
                                             },
                                         ],
                                     },

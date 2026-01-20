@@ -116,7 +116,9 @@ async fn run() -> Result<(), LumenError> {
             watch,
             theme,
             stacked,
+            unified,
         } => {
+            let unified_context = unified.unwrap_or(config.diff.unified_context);
             let options = command::diff::DiffOptions {
                 reference,
                 pr,
@@ -124,6 +126,8 @@ async fn run() -> Result<(), LumenError> {
                 watch,
                 theme: theme.or(config.theme.clone()),
                 stacked,
+                api: config.api,
+                unified_context,
             };
             command::diff::run_diff_ui(options, backend.as_ref())?;
         }

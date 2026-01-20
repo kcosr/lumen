@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
-use crate::command::diff::diff_algo::{compute_side_by_side, find_hunk_starts};
+use crate::command::diff::diff_algo::{compute_side_by_side, find_hunk_ranges};
 
 /// Maximum number of diff lines to include inline when exporting annotations.
 /// Hunks with more lines than this will not include the diff content in the export
@@ -69,12 +69,56 @@ fn build_sidebar_visible_indices(
     visible
 }
 
+fn build_sidebar_visible_filtered(
+    items: &[SidebarItem],
+    matching_files: &HashSet<usize>,
+) -> Vec<usize> {
+    let mut dir_indices: HashMap<&str, usize> = HashMap::new();
+    for (idx, item) in items.iter().enumerate() {
+        if let SidebarItem::Directory { path, .. } = item {
+            dir_indices.insert(path.as_str(), idx);
+        }
+    }
+
+    let mut include_indices: HashSet<usize> = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        if let SidebarItem::File {
+            path,
+            file_index,
+            ..
+        } = item
+        {
+            if !matching_files.contains(file_index) {
+                continue;
+            }
+            include_indices.insert(idx);
+            let parts: Vec<&str> = path.split('/').collect();
+            if parts.len() > 1 {
+                for i in 0..parts.len() - 1 {
+                    let dir_path = parts[..=i].join("/");
+                    if let Some(&dir_idx) = dir_indices.get(dir_path.as_str()) {
+                        include_indices.insert(dir_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, _)| include_indices.contains(&idx).then_some(idx))
+        .collect()
+}
+
 /// An annotation attached to a specific hunk in a file.
 ///
 /// Annotations allow users to add notes to code changes during review.
 /// Each annotation is uniquely identified by its file index and hunk index.
 #[derive(Clone)]
 pub struct HunkAnnotation {
+    /// Stable identifier for persistence
+    pub id: String,
     /// Index of the file in the file_diffs vector
     pub file_index: usize,
     /// Index of the hunk within the file (0-based)
@@ -102,12 +146,45 @@ impl HunkAnnotation {
     #[cfg(not(feature = "jj"))]
     pub fn format_time(&self) -> String {
         use std::time::UNIX_EPOCH;
-        let duration = self.created_at.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let duration = self
+            .created_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let secs = duration.as_secs();
         let hours = (secs / 3600) % 24;
         let minutes = (secs / 60) % 60;
         format!("{:02}:{:02}", hours, minutes)
     }
+}
+
+/// Tags applied to a specific hunk in a file.
+#[derive(Clone)]
+pub struct HunkTags {
+    pub file_index: usize,
+    pub hunk_index: usize,
+    pub filename: String,
+    pub tags: Vec<String>,
+}
+
+/// Review state applied to a specific hunk in a file.
+#[derive(Clone)]
+pub struct HunkReview {
+    pub file_index: usize,
+    pub hunk_index: usize,
+    pub filename: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagFilter {
+    Tag(String),
+    Untagged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewFilter {
+    Reviewed,
+    Unreviewed,
+    All,
 }
 
 pub struct AppState {
@@ -132,6 +209,13 @@ pub struct AppState {
     pub focused_hunk: Option<usize>,
     // Annotation fields
     pub annotations: Vec<HunkAnnotation>,
+    // Tag fields
+    pub hunk_tags: Vec<HunkTags>,
+    pub tag_inventory: Vec<String>,
+    pub tag_filter: Option<TagFilter>,
+    // Review fields
+    pub reviewed_hunks: Vec<HunkReview>,
+    pub review_filter: ReviewFilter,
     // Stacked mode fields
     pub stacked_mode: bool,
     pub stacked_commits: Vec<StackedCommitInfo>,
@@ -145,7 +229,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(file_diffs: Vec<FileDiff>) -> Self {
+    pub fn new(file_diffs: Vec<FileDiff>, settings: DiffViewSettings) -> Self {
         let sidebar_items = build_file_tree(&file_diffs);
         let collapsed_dirs = HashSet::new();
         let sidebar_visible = build_sidebar_visible_indices(&sidebar_items, &collapsed_dirs);
@@ -160,15 +244,14 @@ impl AppState {
                 _ => None,
             })
             .unwrap_or(0);
-        let settings = DiffViewSettings::default();
         let (scroll, focused_hunk) = if !file_diffs.is_empty() && current_file < file_diffs.len() {
             let diff = &file_diffs[current_file];
             let side_by_side =
                 compute_side_by_side(&diff.old_content, &diff.new_content, settings.tab_width);
-            let hunks = find_hunk_starts(&side_by_side);
+            let hunks = find_hunk_ranges(&side_by_side, settings.unified_context);
             let scroll = hunks
                 .first()
-                .map(|&h| (h as u16).saturating_sub(5))
+                .map(|h| (h.start as u16).saturating_sub(5))
                 .unwrap_or(0);
             let focused = if hunks.is_empty() { None } else { Some(0) };
             (scroll, focused)
@@ -197,6 +280,11 @@ impl AppState {
             needs_reload: false,
             focused_hunk,
             annotations: Vec::new(),
+            hunk_tags: Vec::new(),
+            tag_inventory: Vec::new(),
+            tag_filter: None,
+            reviewed_hunks: Vec::new(),
+            review_filter: ReviewFilter::All,
             stacked_mode: false,
             stacked_commits: Vec::new(),
             current_commit_index: 0,
@@ -259,6 +347,26 @@ impl AppState {
             self.sidebar_selected = self.sidebar_visible.len() - 1;
         }
 
+        if self.sidebar_scroll >= self.sidebar_visible.len() {
+            self.sidebar_scroll = self.sidebar_visible.len() - 1;
+        }
+    }
+
+    pub fn rebuild_sidebar_visible_filtered(&mut self, matching_files: &HashSet<usize>) {
+        self.sidebar_visible =
+            build_sidebar_visible_filtered(&self.sidebar_items, matching_files);
+        if self.sidebar_visible.is_empty() {
+            self.sidebar_selected = 0;
+            self.sidebar_scroll = 0;
+            return;
+        }
+        if let Some(idx) = self
+            .sidebar_visible
+            .iter()
+            .position(|idx| matches!(self.sidebar_items[*idx], SidebarItem::File { .. }))
+        {
+            self.sidebar_selected = idx;
+        }
         if self.sidebar_scroll >= self.sidebar_visible.len() {
             self.sidebar_scroll = self.sidebar_visible.len() - 1;
         }
@@ -419,7 +527,8 @@ impl AppState {
                     &diff.new_content,
                     self.settings.tab_width,
                 );
-                let hunk_count = find_hunk_starts(&side_by_side).len();
+                let hunk_count =
+                    find_hunk_ranges(&side_by_side, self.settings.unified_context).len();
                 (diff.filename.as_str(), (idx, hunk_count))
             })
             .collect();
@@ -437,6 +546,34 @@ impl AppState {
                 }
             } else {
                 // File no longer exists
+                false
+            }
+        });
+
+        // Filter and update tags
+        self.hunk_tags.retain_mut(|hunk| {
+            if let Some(&(new_file_index, hunk_count)) = file_info.get(hunk.filename.as_str()) {
+                if hunk.hunk_index < hunk_count {
+                    hunk.file_index = new_file_index;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+
+        // Filter and update reviewed hunks
+        self.reviewed_hunks.retain_mut(|hunk| {
+            if let Some(&(new_file_index, hunk_count)) = file_info.get(hunk.filename.as_str()) {
+                if hunk.hunk_index < hunk_count {
+                    hunk.file_index = new_file_index;
+                    true
+                } else {
+                    false
+                }
+            } else {
                 false
             }
         });
@@ -490,10 +627,10 @@ impl AppState {
             &diff.new_content,
             self.settings.tab_width,
         );
-        let hunks = find_hunk_starts(&side_by_side);
+        let hunks = find_hunk_ranges(&side_by_side, self.settings.unified_context);
         self.scroll = hunks
             .first()
-            .map(|&h| (h as u16).saturating_sub(5))
+            .map(|h| (h.start as u16).saturating_sub(5))
             .unwrap_or(0);
         self.h_scroll = 0;
         self.focused_hunk = if hunks.is_empty() { None } else { Some(0) };
@@ -508,11 +645,9 @@ impl AppState {
 
     /// Add or update an annotation
     pub fn set_annotation(&mut self, annotation: HunkAnnotation) {
-        if let Some(existing) = self
-            .annotations
-            .iter_mut()
-            .find(|a| a.file_index == annotation.file_index && a.hunk_index == annotation.hunk_index)
-        {
+        if let Some(existing) = self.annotations.iter_mut().find(|a| {
+            a.file_index == annotation.file_index && a.hunk_index == annotation.hunk_index
+        }) {
             *existing = annotation;
         } else {
             self.annotations.push(annotation);
@@ -523,6 +658,48 @@ impl AppState {
     pub fn remove_annotation(&mut self, file_index: usize, hunk_index: usize) {
         self.annotations
             .retain(|a| !(a.file_index == file_index && a.hunk_index == hunk_index));
+    }
+
+    pub fn get_hunk_tags(&self, file_index: usize, hunk_index: usize) -> Option<&HunkTags> {
+        self.hunk_tags
+            .iter()
+            .find(|t| t.file_index == file_index && t.hunk_index == hunk_index)
+    }
+
+    pub fn set_hunk_tags(&mut self, hunk_tags: HunkTags) {
+        if let Some(existing) = self.hunk_tags.iter_mut().find(|t| {
+            t.file_index == hunk_tags.file_index && t.hunk_index == hunk_tags.hunk_index
+        }) {
+            *existing = hunk_tags;
+        } else {
+            self.hunk_tags.push(hunk_tags);
+        }
+    }
+
+    pub fn remove_hunk_tags(&mut self, file_index: usize, hunk_index: usize) {
+        self.hunk_tags
+            .retain(|t| !(t.file_index == file_index && t.hunk_index == hunk_index));
+    }
+
+    pub fn is_hunk_reviewed(&self, file_index: usize, hunk_index: usize) -> bool {
+        self.reviewed_hunks
+            .iter()
+            .any(|h| h.file_index == file_index && h.hunk_index == hunk_index)
+    }
+
+    pub fn set_hunk_reviewed(&mut self, hunk_review: HunkReview) {
+        if !self
+            .reviewed_hunks
+            .iter()
+            .any(|h| h.file_index == hunk_review.file_index && h.hunk_index == hunk_review.hunk_index)
+        {
+            self.reviewed_hunks.push(hunk_review);
+        }
+    }
+
+    pub fn remove_hunk_reviewed(&mut self, file_index: usize, hunk_index: usize) {
+        self.reviewed_hunks
+            .retain(|h| !(h.file_index == file_index && h.hunk_index == hunk_index));
     }
 
     /// Format all annotations for export with full diff context
@@ -572,7 +749,10 @@ impl AppState {
                                 })
                                 .unwrap_or("base");
                             if old_start == old_end {
-                                output.push_str(&format!(" (deleted from {}:L{})", base_ref, old_start));
+                                output.push_str(&format!(
+                                    " (deleted from {}:L{})",
+                                    base_ref, old_start
+                                ));
                             } else {
                                 output.push_str(&format!(
                                     " (deleted from {}:L{}-{})",
@@ -629,12 +809,16 @@ impl AppState {
         hunk_index: usize,
     ) -> Option<(Option<(usize, usize)>, Option<(usize, usize)>, String)> {
         let diff = self.file_diffs.get(file_index)?;
-        let side_by_side =
-            compute_side_by_side(&diff.old_content, &diff.new_content, self.settings.tab_width);
-        let hunks = find_hunk_starts(&side_by_side);
+        let side_by_side = compute_side_by_side(
+            &diff.old_content,
+            &diff.new_content,
+            self.settings.tab_width,
+        );
+        let hunks = find_hunk_ranges(&side_by_side, self.settings.unified_context);
 
-        let hunk_start = *hunks.get(hunk_index)?;
-        let next_hunk_start = hunks.get(hunk_index + 1).copied().unwrap_or(side_by_side.len());
+        let hunk_range = hunks.get(hunk_index)?;
+        let hunk_start = hunk_range.start;
+        let next_hunk_start = hunk_range.end;
 
         let mut diff_lines = String::new();
         let mut old_start: Option<usize> = None;

@@ -189,6 +189,11 @@ Priority: CLI flag > config file > `LUMEN_THEME` env var > OS auto-detect.
 Add comments to hunks during code review:
 - `i`: Add/edit annotation on focused hunk
 - `I`: View all annotations (edit, delete, copy, or export)
+- `t`: Tag focused hunk
+- `T`: Cycle tag filter (tagged, untagged, all)
+- `v`: Toggle reviewed on focused hunk
+- `V`: Cycle review filter (reviewed, unreviewed, all)
+- `C`: Clear all filters
 
 Annotations can be copied to clipboard or exported to a file for sharing.
 

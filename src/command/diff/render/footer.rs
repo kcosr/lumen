@@ -19,6 +19,10 @@ pub struct FooterData<'a> {
     pub focused_hunk: Option<usize>,
     pub search_state: &'a SearchState,
     pub area_width: u16,
+    pub tag_filter_label: Option<String>,
+    pub review_filter_label: Option<String>,
+    pub focused_tags: Option<String>,
+    pub focused_review_label: Option<String>,
 }
 
 /// Truncates a file path by abbreviating directory names to their first character.
@@ -82,6 +86,13 @@ pub fn truncate_path(path: &str, max_len: usize) -> String {
     } else {
         format!("{}{}", prefix, filename)
     }
+}
+
+fn truncate_text(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    format!("{}...", &text[..max_len.saturating_sub(3)])
 }
 
 pub fn render_footer(frame: &mut Frame, footer_area: Rect, data: FooterData) {
@@ -203,7 +214,10 @@ pub fn render_footer(frame: &mut Frame, footer_area: Rect, data: FooterData) {
                 Span::styled(viewed_indicator, Style::default().fg(t.ui.viewed).bg(bg)),
             ];
             spans.extend(stats_spans);
-            spans.push(Span::styled(watch_indicator, Style::default().fg(t.ui.watching).bg(bg)));
+            spans.push(Span::styled(
+                watch_indicator,
+                Style::default().fg(t.ui.watching).bg(bg),
+            ));
             spans
         };
 
@@ -223,47 +237,73 @@ pub fn render_footer(frame: &mut Frame, footer_area: Rect, data: FooterData) {
                 format!("[0/0] /{} ", data.search_state.query)
             };
             vec![
-                Span::styled(
-                    search_info,
-                    Style::default().fg(t.ui.highlight).bg(bg),
-                ),
+                Span::styled(search_info, Style::default().fg(t.ui.highlight).bg(bg)),
                 Span::styled(
                     " n/N navigate ",
                     Style::default().fg(t.ui.text_muted).bg(bg),
                 ),
             ]
         } else {
-            vec![
-                Span::styled(
-                    if let Some(idx) = data.focused_hunk {
-                        format!(
-                            "({}/{} {}) ",
-                            idx + 1,
-                            data.hunk_count,
-                            if data.hunk_count == 1 {
-                                "hunk"
-                            } else {
-                                "hunks"
-                            }
-                        )
-                    } else {
-                        format!(
-                            "({} {}) ",
-                            data.hunk_count,
-                            if data.hunk_count == 1 {
-                                "hunk"
-                            } else {
-                                "hunks"
-                            }
-                        )
-                    },
+            let mut spans = vec![Span::styled(
+                if let Some(idx) = data.focused_hunk {
+                    format!(
+                        "({}/{} {}) ",
+                        idx + 1,
+                        data.hunk_count,
+                        if data.hunk_count == 1 {
+                            "hunk"
+                        } else {
+                            "hunks"
+                        }
+                    )
+                } else {
+                    format!(
+                        "({} {}) ",
+                        data.hunk_count,
+                        if data.hunk_count == 1 {
+                            "hunk"
+                        } else {
+                            "hunks"
+                        }
+                    )
+                },
+                Style::default().fg(t.ui.text_muted).bg(bg),
+            )];
+
+            if let Some(label) = data.tag_filter_label.as_deref() {
+                spans.push(Span::styled(
+                    format!("[{}] ", label),
                     Style::default().fg(t.ui.text_muted).bg(bg),
-                ),
-                Span::styled(
-                    " ? help ",
+                ));
+            }
+
+            if let Some(label) = data.review_filter_label.as_deref() {
+                spans.push(Span::styled(
+                    format!("[{}] ", label),
                     Style::default().fg(t.ui.text_muted).bg(bg),
-                ),
-            ]
+                ));
+            }
+
+            if let Some(tags) = data.focused_tags.as_deref() {
+                let short = truncate_text(tags, 30);
+                spans.push(Span::styled(
+                    format!("tags: {} ", short),
+                    Style::default().fg(t.ui.text_muted).bg(bg),
+                ));
+            }
+
+            if let Some(label) = data.focused_review_label.as_deref() {
+                spans.push(Span::styled(
+                    format!("review: {} ", label),
+                    Style::default().fg(t.ui.text_muted).bg(bg),
+                ));
+            }
+
+            spans.push(Span::styled(
+                " ? help ",
+                Style::default().fg(t.ui.text_muted).bg(bg),
+            ));
+            spans
         };
 
         let left_line = Line::from(left_spans);
@@ -277,10 +317,7 @@ pub fn render_footer(frame: &mut Frame, footer_area: Rect, data: FooterData) {
         let padding = footer_width.saturating_sub(left_len + right_len);
 
         let mut final_spans: Vec<Span> = left_line.spans;
-        final_spans.push(Span::styled(
-            " ".repeat(padding),
-            Style::default().bg(bg),
-        ));
+        final_spans.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
         final_spans.extend(right_line.spans);
 
         let footer = Paragraph::new(Line::from(final_spans)).style(Style::default().bg(bg));

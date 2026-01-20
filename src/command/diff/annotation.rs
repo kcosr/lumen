@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use tui_textarea::TextArea;
+use uuid::Uuid;
 
 use super::state::HunkAnnotation;
 use super::theme;
@@ -32,6 +33,8 @@ pub struct AnnotationEditor<'a> {
     is_edit: bool,
     /// Original creation time (preserved when editing)
     original_created_at: Option<SystemTime>,
+    /// Preserve persistent annotation ID when editing
+    annotation_id: Option<String>,
 }
 
 impl<'a> AnnotationEditor<'a> {
@@ -57,17 +60,20 @@ impl<'a> AnnotationEditor<'a> {
             line_range,
             is_edit: false,
             original_created_at: None,
+            annotation_id: None,
         }
     }
 
-    pub fn with_content(mut self, content: &str, created_at: SystemTime) -> Self {
+    pub fn with_content(mut self, content: &str, created_at: SystemTime, id: String) -> Self {
         self.textarea = TextArea::new(content.lines().map(String::from).collect());
         self.is_edit = true;
         self.original_created_at = Some(created_at);
+        self.annotation_id = Some(id);
 
         let t = theme::get();
         self.textarea.set_cursor_line_style(Style::default());
-        self.textarea.set_cursor_style(Style::default().bg(t.ui.text_primary).fg(t.ui.bg));
+        self.textarea
+            .set_cursor_style(Style::default().bg(t.ui.text_primary).fg(t.ui.bg));
         self.textarea.set_block(Block::default());
 
         // Move cursor to end
@@ -105,7 +111,10 @@ impl<'a> AnnotationEditor<'a> {
             // Enter handling: with modifiers = newline, without = save
             KeyCode::Enter => {
                 // Shift+Enter, Alt+Enter, or Ctrl+Enter = newline
-                if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL) {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+                {
                     self.textarea.insert_char('\n');
                     AnnotationEditorResult::Continue
                 } else {
@@ -165,18 +174,12 @@ impl<'a> AnnotationEditor<'a> {
         frame.render_widget(Clear, modal_area);
 
         // Extract just the filename without path for cleaner display
-        let short_filename = self
-            .filename
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.filename);
+        let short_filename = self.filename.rsplit('/').next().unwrap_or(&self.filename);
 
         // Compact title
         let title = format!(
             " {} · L{}-{} ",
-            short_filename,
-            self.line_range.0,
-            self.line_range.1
+            short_filename, self.line_range.0, self.line_range.1
         );
 
         let block = Block::default()
@@ -219,7 +222,12 @@ impl<'a> AnnotationEditor<'a> {
 
     /// Create a HunkAnnotation from the current editor state
     pub fn to_annotation(&self) -> HunkAnnotation {
+        let id = self
+            .annotation_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         HunkAnnotation {
+            id,
             file_index: self.file_index,
             hunk_index: self.hunk_index,
             content: self.textarea.lines().join("\n"),

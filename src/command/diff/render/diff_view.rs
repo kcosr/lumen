@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::command::diff::context::{compute_context_lines, ContextLine};
-use crate::command::diff::diff_algo::compute_side_by_side;
+use crate::command::diff::diff_algo::{compute_side_by_side, HunkRange};
 use crate::command::diff::highlight::{highlight_line_spans, FileHighlighter};
 use crate::command::diff::search::{MatchPanel, SearchState};
 use crate::command::diff::state::HunkAnnotation;
@@ -92,7 +92,10 @@ fn render_stacked_header(
         Span::styled(" ", spacer_style),
         Span::styled(&id_label, badge_style.fg(t.ui.footer_branch_fg)),
         Span::styled("  ", spacer_style),
-        Span::styled(&truncated_msg, Style::default().fg(t.ui.text_secondary).bg(bg)),
+        Span::styled(
+            &truncated_msg,
+            Style::default().fg(t.ui.text_secondary).bg(bg),
+        ),
     ];
 
     // Calculate widths for centering
@@ -488,7 +491,11 @@ struct DiffLineStyle {
 }
 
 impl DiffLineStyle {
-    fn for_change_type(change_type: ChangeType, bg: Color, t: &crate::command::diff::theme::Theme) -> Self {
+    fn for_change_type(
+        change_type: ChangeType,
+        bg: Color,
+        t: &crate::command::diff::theme::Theme,
+    ) -> Self {
         match change_type {
             ChangeType::Equal => Self {
                 old_bg: Some(bg),
@@ -631,7 +638,10 @@ fn render_annotation_overlays(
         )]));
 
         // Add content lines
-        for content_line in content_lines.iter().take(available_height.saturating_sub(2)) {
+        for content_line in content_lines
+            .iter()
+            .take(available_height.saturating_sub(2))
+        {
             let content_width_inner = border_width.saturating_sub(1);
             let padded_content = format!("{:<width$}", content_line, width = content_width_inner);
             ann_lines.push(Line::from(vec![
@@ -684,7 +694,12 @@ pub fn render_diff(
     commit_ref: &str,
     pr_info: Option<&PrInfo>,
     focused_hunk: Option<usize>,
-    hunks: &[usize],
+    hunks: &[HunkRange],
+    footer_focused_hunk: Option<usize>,
+    tag_filter_label: Option<String>,
+    review_filter_label: Option<String>,
+    focused_tags: Option<String>,
+    focused_review_label: Option<String>,
     stacked_mode: bool,
     stacked_commit: Option<&StackedCommitInfo>,
     stacked_index: usize,
@@ -791,6 +806,10 @@ pub fn render_diff(
                 focused_hunk: None,
                 search_state,
                 area_width: area.width,
+                tag_filter_label: tag_filter_label.clone(),
+                review_filter_label: review_filter_label.clone(),
+                focused_tags: focused_tags.clone(),
+                focused_review_label: focused_review_label.clone(),
             },
         );
         return;
@@ -908,7 +927,16 @@ pub fn render_diff(
         let content_x = main_area.x + 1;
         let content_start_y = main_area.y + 1;
         let content_width = main_area.width.saturating_sub(2);
-        render_annotation_overlays(frame, &annotation_overlays, content_x, content_start_y, content_width, main_area, bg, t);
+        render_annotation_overlays(
+            frame,
+            &annotation_overlays,
+            content_x,
+            content_start_y,
+            content_width,
+            main_area,
+            bg,
+            t,
+        );
     } else if is_deleted_file {
         let visible_height = main_area.height.saturating_sub(2) as usize;
         let old_context = compute_context_lines(
@@ -1002,7 +1030,16 @@ pub fn render_diff(
         let content_x = main_area.x + 1;
         let content_start_y = main_area.y + 1;
         let content_width = main_area.width.saturating_sub(2);
-        render_annotation_overlays(frame, &annotation_overlays, content_x, content_start_y, content_width, main_area, bg, t);
+        render_annotation_overlays(
+            frame,
+            &annotation_overlays,
+            content_x,
+            content_start_y,
+            content_width,
+            main_area,
+            bg,
+            t,
+        );
     } else {
         let (old_area, new_area) = match diff_fullscreen {
             DiffFullscreen::OldOnly => (Some(main_area), None),
@@ -1070,14 +1107,25 @@ pub fn render_diff(
             }
         }
 
+        let last_changed_by_hunk: Vec<Option<usize>> = hunks
+            .iter()
+            .map(|hunk| {
+                (hunk.start..hunk.end)
+                    .rev()
+                    .find(|&idx| match side_by_side.get(idx) {
+                        Some(dl) => !matches!(dl.change_type, ChangeType::Equal),
+                        None => false,
+                    })
+            })
+            .collect();
+
         let is_in_focused_hunk = |line_idx: usize, change_type: ChangeType| -> bool {
             if matches!(change_type, ChangeType::Equal) {
                 return false;
             }
             if let Some(hunk_idx) = focused_hunk {
-                if let Some(&hunk_start) = hunks.get(hunk_idx) {
-                    let hunk_end = hunks.get(hunk_idx + 1).copied().unwrap_or(usize::MAX);
-                    return line_idx >= hunk_start && line_idx < hunk_end;
+                if let Some(hunk) = hunks.get(hunk_idx) {
+                    return line_idx >= hunk.start && line_idx < hunk.end;
                 }
             }
             false
@@ -1085,47 +1133,33 @@ pub fn render_diff(
 
         // Find the hunk index for a given line, returns None if the line is not in a hunk
         let get_hunk_for_line = |line_idx: usize| -> Option<usize> {
-            for (hunk_idx, &hunk_start) in hunks.iter().enumerate() {
-                let hunk_end = hunks.get(hunk_idx + 1).copied().unwrap_or(usize::MAX);
-                if line_idx >= hunk_start && line_idx < hunk_end {
+            for (hunk_idx, hunk) in hunks.iter().enumerate() {
+                if line_idx >= hunk.start && line_idx < hunk.end {
                     return Some(hunk_idx);
                 }
             }
             None
         };
 
-
         // Check if this line is the last changed line of a hunk (before Equal or end of hunk)
-        let is_last_changed_line_of_hunk = |line_idx: usize, lines: &[&DiffLine]| -> Option<usize> {
-            let current_idx_in_slice = line_idx.saturating_sub(scroll_usize);
-            if current_idx_in_slice >= lines.len() {
-                return None;
-            }
-            let current_line = lines[current_idx_in_slice];
-            // Current line must be a change
-            if matches!(current_line.change_type, ChangeType::Equal) {
-                return None;
-            }
-            // Check next line
-            let next_idx = current_idx_in_slice + 1;
-            let is_last = if next_idx >= lines.len() {
-                // End of visible lines - only consider it "last" if the hunk actually ends here
-                if let Some(hunk_idx) = get_hunk_for_line(line_idx) {
-                    let hunk_end = hunks.get(hunk_idx + 1).copied().unwrap_or(side_by_side.len());
-                    // Check if next absolute line is at or past hunk end, or at end of file
-                    line_idx + 1 >= hunk_end || line_idx + 1 >= side_by_side.len()
-                } else {
-                    false
+        let is_last_changed_line_of_hunk =
+            |line_idx: usize, lines: &[&DiffLine]| -> Option<usize> {
+                let current_idx_in_slice = line_idx.saturating_sub(scroll_usize);
+                if current_idx_in_slice >= lines.len() {
+                    return None;
                 }
-            } else {
-                matches!(lines[next_idx].change_type, ChangeType::Equal)
-            };
-            if is_last {
-                get_hunk_for_line(line_idx)
-            } else {
+                let current_line = lines[current_idx_in_slice];
+                if matches!(current_line.change_type, ChangeType::Equal) {
+                    return None;
+                }
+                let hunk_idx = get_hunk_for_line(line_idx)?;
+                if let Some(Some(last_idx)) = last_changed_by_hunk.get(hunk_idx) {
+                    if line_idx == *last_idx {
+                        return Some(hunk_idx);
+                    }
+                }
                 None
-            }
-        };
+            };
 
         for (i, diff_line) in visible_lines.iter().enumerate() {
             let line_idx = scroll_usize + i;
@@ -1350,7 +1384,16 @@ pub fn render_diff(
             render_area.width.saturating_sub(2)
         };
 
-        render_annotation_overlays(frame, &annotation_overlays, content_x, content_start_y, content_width, main_area, bg, t);
+        render_annotation_overlays(
+            frame,
+            &annotation_overlays,
+            content_x,
+            content_start_y,
+            content_width,
+            main_area,
+            bg,
+            t,
+        );
     }
 
     render_footer(
@@ -1366,9 +1409,13 @@ pub fn render_diff(
             line_stats_added: line_stats.added,
             line_stats_removed: line_stats.removed,
             hunk_count,
-            focused_hunk,
+            focused_hunk: footer_focused_hunk,
             search_state,
             area_width: area.width,
+            tag_filter_label,
+            review_filter_label,
+            focused_tags,
+            focused_review_label,
         },
     );
 }

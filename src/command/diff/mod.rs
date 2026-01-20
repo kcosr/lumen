@@ -1,15 +1,21 @@
 mod annotation;
+mod api;
 mod app;
 mod context;
 mod diff_algo;
 pub mod git;
 pub mod highlight;
+mod persistence;
+mod review;
 mod render;
 mod search;
 mod state;
 mod sticky_lines;
+mod tag_editor;
+mod tags;
 pub mod theme;
 mod types;
+mod view_state;
 mod watcher;
 
 use std::collections::HashSet;
@@ -27,6 +33,8 @@ pub struct DiffOptions {
     pub watch: bool,
     pub theme: Option<String>,
     pub stacked: bool,
+    pub api: crate::config::ApiConfig,
+    pub unified_context: usize,
 }
 
 #[derive(Clone)]

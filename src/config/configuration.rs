@@ -29,6 +29,12 @@ pub struct LumenConfig {
 
     #[serde(default)]
     pub theme: Option<String>,
+
+    #[serde(default)]
+    pub api: ApiConfig,
+
+    #[serde(default)]
+    pub diff: DiffConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -38,6 +44,37 @@ pub struct DraftConfig {
         deserialize_with = "deserialize_commit_types"
     )]
     pub commit_types: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default = "default_api_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_api_bind")]
+    pub bind: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffConfig {
+    #[serde(default = "default_unified_context")]
+    pub unified_context: usize,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        DiffConfig {
+            unified_context: default_unified_context(),
+        }
+    }
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        ApiConfig {
+            enabled: default_api_enabled(),
+            bind: default_api_bind(),
+        }
+    }
 }
 
 fn default_ai_provider() -> ProviderType {
@@ -80,6 +117,18 @@ fn default_model() -> Option<String> {
 
 fn default_api_key() -> Option<String> {
     std::env::var("LUMEN_API_KEY").ok()
+}
+
+fn default_api_enabled() -> bool {
+    false
+}
+
+fn default_api_bind() -> String {
+    "127.0.0.1:7878".to_string()
+}
+
+fn default_unified_context() -> usize {
+    3
 }
 
 fn deserialize_commit_types<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -126,6 +175,8 @@ impl LumenConfig {
             api_key,
             draft: config.draft,
             theme: config.theme,
+            api: config.api,
+            diff: config.diff,
         })
     }
 
@@ -151,6 +202,8 @@ impl Default for LumenConfig {
             api_key: default_api_key(),
             draft: default_draft_config(),
             theme: None,
+            api: ApiConfig::default(),
+            diff: DiffConfig::default(),
         }
     }
 }
