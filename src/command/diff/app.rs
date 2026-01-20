@@ -1095,9 +1095,8 @@ fn run_app_internal(
     } else {
         ViewStateManager::try_new()?
     };
-    let mut current_scope = None;
-    if let Some(ref mut persistence) = persistence {
-        current_scope = load_persistence_for_state(
+    let mut current_scope = if let Some(ref mut persistence) = persistence {
+        load_persistence_for_state(
             persistence,
             view_state.as_mut(),
             tag_manager.as_mut(),
@@ -1105,10 +1104,10 @@ fn run_app_internal(
             &mut state,
             &options,
             backend,
-        );
+        )
     } else {
-        current_scope = determine_scope(&state, &options, backend);
-        if let Some(ref scope) = current_scope {
+        let scope = determine_scope(&state, &options, backend);
+        if let Some(ref scope) = scope {
             if let Some(ref mut tag_manager) = tag_manager {
                 if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
                     eprintln!("Warning: failed to load tags: {}", err);
@@ -1120,7 +1119,8 @@ fn run_app_internal(
                 }
             }
         }
-    }
+        scope
+    };
 
     // Load viewed files from GitHub on startup in PR mode
     if let Some(ref pr) = pr_info {
