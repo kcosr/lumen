@@ -100,6 +100,7 @@ Notes:
 - Restore current file, scroll position, and focused hunk on startup.
 - Persist viewed-file toggles immediately on change.
 - Persist tag and review filters per scope.
+- Start with sidebar focused when opening the diff viewer.
 
 ### Storage Layout
 ```
