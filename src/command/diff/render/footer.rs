@@ -20,7 +20,9 @@ pub struct FooterData<'a> {
     pub search_state: &'a SearchState,
     pub area_width: u16,
     pub tag_filter_label: Option<String>,
+    pub review_filter_label: Option<String>,
     pub focused_tags: Option<String>,
+    pub focused_review_label: Option<String>,
 }
 
 /// Truncates a file path by abbreviating directory names to their first character.
@@ -275,10 +277,24 @@ pub fn render_footer(frame: &mut Frame, footer_area: Rect, data: FooterData) {
                 ));
             }
 
+            if let Some(label) = data.review_filter_label.as_deref() {
+                spans.push(Span::styled(
+                    format!("[{}] ", label),
+                    Style::default().fg(t.ui.text_muted).bg(bg),
+                ));
+            }
+
             if let Some(tags) = data.focused_tags.as_deref() {
                 let short = truncate_text(tags, 30);
                 spans.push(Span::styled(
                     format!("tags: {} ", short),
+                    Style::default().fg(t.ui.text_muted).bg(bg),
+                ));
+            }
+
+            if let Some(label) = data.focused_review_label.as_deref() {
+                spans.push(Span::styled(
+                    format!("review: {} ", label),
                     Style::default().fg(t.ui.text_muted).bg(bg),
                 ));
             }

@@ -136,3 +136,19 @@ TEST unified block line 2.
 ### API + CLI
 - HTTP: `GET /tags`, `GET /tags/current`, `POST /tags/set` with `{ "tags": ["foo"] }`.
 - CLI: `lumen-cli tag list|current|set <tags..>|add <tag>|remove <tag>|clear`.
+
+## Hunk Reviews
+
+### Summary
+- Toggle reviewed on a focused hunk with `v`.
+- Filter hunks/files by review state with `V` (reviewed → unreviewed → all).
+- Review filter combines with tag filter; `C` clears all filters.
+
+### Storage Layout
+```
+.lumen/review/working-tree.json
+.lumen/review/<sha>.json
+```
+
+### UI Notes
+- Footer shows the active review filter and review status for the focused hunk.

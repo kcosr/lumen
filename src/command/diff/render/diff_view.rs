@@ -697,7 +697,9 @@ pub fn render_diff(
     hunks: &[HunkRange],
     footer_focused_hunk: Option<usize>,
     tag_filter_label: Option<String>,
+    review_filter_label: Option<String>,
     focused_tags: Option<String>,
+    focused_review_label: Option<String>,
     stacked_mode: bool,
     stacked_commit: Option<&StackedCommitInfo>,
     stacked_index: usize,
@@ -805,7 +807,9 @@ pub fn render_diff(
                 search_state,
                 area_width: area.width,
                 tag_filter_label: tag_filter_label.clone(),
+                review_filter_label: review_filter_label.clone(),
                 focused_tags: focused_tags.clone(),
+                focused_review_label: focused_review_label.clone(),
             },
         );
         return;
@@ -1409,7 +1413,9 @@ pub fn render_diff(
             search_state,
             area_width: area.width,
             tag_filter_label,
+            review_filter_label,
             focused_tags,
+            focused_review_label,
         },
     );
 }

@@ -21,6 +21,7 @@ use super::git::{
 };
 use super::highlight;
 use super::persistence::{DiffScope, PersistenceManager};
+use super::review::ReviewManager;
 use super::tag_editor::{TagEditor, TagEditorResult};
 use super::tags::TagManager;
 use super::view_state::ViewStateManager;
@@ -29,7 +30,7 @@ use super::render::{
     ModalContent, ModalFileStatus, ModalResult,
 };
 use super::state::{
-    adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey, TagFilter,
+    adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey, ReviewFilter, TagFilter,
 };
 use super::theme;
 use super::types::{ChangeType, DiffFullscreen, FileStatus, FocusedPanel, SidebarItem};
@@ -342,7 +343,7 @@ fn compute_hunk_line_range(
     Some((start_line, end_line))
 }
 
-fn hunk_matches_filter(
+fn hunk_matches_tag_filter(
     state: &AppState,
     file_index: usize,
     hunk_index: usize,
@@ -361,70 +362,115 @@ fn hunk_matches_filter(
     }
 }
 
+fn hunk_matches_review_filter(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    filter: ReviewFilter,
+) -> bool {
+    match filter {
+        ReviewFilter::All => true,
+        ReviewFilter::Reviewed => state.is_hunk_reviewed(file_index, hunk_index),
+        ReviewFilter::Unreviewed => !state.is_hunk_reviewed(file_index, hunk_index),
+    }
+}
+
+fn hunk_matches_filters(
+    state: &AppState,
+    file_index: usize,
+    hunk_index: usize,
+    tag_filter: Option<&TagFilter>,
+    review_filter: ReviewFilter,
+) -> bool {
+    hunk_matches_tag_filter(state, file_index, hunk_index, tag_filter)
+        && hunk_matches_review_filter(state, file_index, hunk_index, review_filter)
+}
+
 fn matching_hunk_indices(
     state: &AppState,
     file_index: usize,
     hunks: &[HunkRange],
-    filter: Option<&TagFilter>,
+    tag_filter: Option<&TagFilter>,
+    review_filter: ReviewFilter,
 ) -> Vec<usize> {
     hunks
         .iter()
         .enumerate()
-        .filter(|(idx, _)| hunk_matches_filter(state, file_index, *idx, filter))
+        .filter(|(idx, _)| hunk_matches_filters(state, file_index, *idx, tag_filter, review_filter))
         .map(|(idx, _)| idx)
         .collect()
 }
 
-fn matching_files_for_filter(state: &AppState, filter: &TagFilter) -> HashSet<usize> {
-    match filter {
-        TagFilter::Tag(tag) => state
-            .hunk_tags
-            .iter()
-            .filter(|hunk| hunk.tags.iter().any(|t| t == tag))
-            .map(|hunk| hunk.file_index)
-            .collect(),
-        TagFilter::Untagged => {
-            let mut files = HashSet::new();
-            for (idx, diff) in state.file_diffs.iter().enumerate() {
-                let side_by_side = compute_side_by_side(
-                    &diff.old_content,
-                    &diff.new_content,
-                    state.settings.tab_width,
-                );
-                let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
-                for hunk_idx in 0..hunks.len() {
-                    if hunk_matches_filter(state, idx, hunk_idx, Some(filter)) {
-                        files.insert(idx);
-                        break;
-                    }
-                }
+fn matching_files_for_filters(
+    state: &AppState,
+    tag_filter: Option<&TagFilter>,
+    review_filter: ReviewFilter,
+) -> HashSet<usize> {
+    let mut files = HashSet::new();
+    for (idx, diff) in state.file_diffs.iter().enumerate() {
+        let side_by_side = compute_side_by_side(
+            &diff.old_content,
+            &diff.new_content,
+            state.settings.tab_width,
+        );
+        let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+        for hunk_idx in 0..hunks.len() {
+            if hunk_matches_filters(state, idx, hunk_idx, tag_filter, review_filter) {
+                files.insert(idx);
+                break;
             }
-            files
         }
+    }
+    files
+}
+
+fn apply_filters(state: &mut AppState) {
+    if state.tag_filter.is_none() && state.review_filter == ReviewFilter::All {
+        state.rebuild_sidebar_visible();
+        return;
+    }
+    let matching_files = matching_files_for_filters(state, state.tag_filter.as_ref(), state.review_filter);
+    state.rebuild_sidebar_visible_filtered(&matching_files);
+    if matching_files.contains(&state.current_file) {
+        return;
+    }
+    if let Some(file_index) = state.sidebar_visible.iter().find_map(|idx| {
+        if let SidebarItem::File { file_index, .. } = state.sidebar_items[*idx] {
+            Some(file_index)
+        } else {
+            None
+        }
+    }) {
+        state.select_file(file_index);
+    } else {
+        state.current_file = 0;
+        state.focused_hunk = None;
     }
 }
 
-fn apply_tag_filter(state: &mut AppState) {
-    if let Some(filter) = state.tag_filter.as_ref() {
-        let matching_files = matching_files_for_filter(state, filter);
-        state.rebuild_sidebar_visible_filtered(&matching_files);
-        if matching_files.contains(&state.current_file) {
-            return;
-        }
-        if let Some(file_index) = state.sidebar_visible.iter().find_map(|idx| {
-            if let SidebarItem::File { file_index, .. } = state.sidebar_items[*idx] {
-                Some(file_index)
-            } else {
-                None
-            }
-        }) {
-            state.select_file(file_index);
+fn focus_first_matching_hunk(state: &mut AppState, visible_height: usize, max_scroll: usize) {
+    if let Some(diff) = state.file_diffs.get(state.current_file) {
+        let side_by_side =
+            compute_side_by_side(&diff.old_content, &diff.new_content, state.settings.tab_width);
+        let hunks = find_hunk_ranges(&side_by_side, state.settings.unified_context);
+        let matching = matching_hunk_indices(
+            state,
+            state.current_file,
+            &hunks,
+            state.tag_filter.as_ref(),
+            state.review_filter,
+        );
+        if let Some(first) = matching.first().copied() {
+            state.focused_hunk = Some(first);
+            state.scroll = adjust_scroll_for_hunk(
+                hunks[first].start,
+                state.scroll,
+                visible_height,
+                max_scroll,
+            );
         } else {
-            state.current_file = 0;
             state.focused_hunk = None;
         }
-    } else {
-        state.rebuild_sidebar_visible();
     }
 }
 
@@ -445,6 +491,14 @@ fn next_tag_filter(current: Option<&TagFilter>, tags: &[String]) -> Option<TagFi
                 sequence.first().cloned()
             }
         }
+    }
+}
+
+fn next_review_filter(current: ReviewFilter) -> ReviewFilter {
+    match current {
+        ReviewFilter::All => ReviewFilter::Reviewed,
+        ReviewFilter::Reviewed => ReviewFilter::Unreviewed,
+        ReviewFilter::Unreviewed => ReviewFilter::All,
     }
 }
 
@@ -875,6 +929,7 @@ fn load_persistence_for_state(
     persistence: &mut PersistenceManager,
     view_state: Option<&mut ViewStateManager>,
     tag_manager: Option<&mut TagManager>,
+    review_manager: Option<&ReviewManager>,
     state: &mut AppState,
     options: &DiffOptions,
     backend: &dyn VcsBackend,
@@ -891,6 +946,11 @@ fn load_persistence_for_state(
     if let Some(tag_manager) = tag_manager {
         if let Err(err) = tag_manager.load_for_scope(state, &scope) {
             eprintln!("Warning: failed to load tags: {}", err);
+        }
+    }
+    if let Some(review_manager) = review_manager {
+        if let Err(err) = review_manager.load_for_scope(state, &scope) {
+            eprintln!("Warning: failed to load reviewed hunks: {}", err);
         }
     }
     Some(scope)
@@ -1029,6 +1089,7 @@ fn run_app_internal(
         PersistenceManager::try_new()?
     };
     let mut tag_manager = TagManager::try_new()?;
+    let review_manager = ReviewManager::try_new()?;
     let mut view_state = if pr_info.is_some() {
         None
     } else {
@@ -1040,15 +1101,23 @@ fn run_app_internal(
             persistence,
             view_state.as_mut(),
             tag_manager.as_mut(),
+            review_manager.as_ref(),
             &mut state,
             &options,
             backend,
         );
-    } else if let Some(ref mut tag_manager) = tag_manager {
+    } else {
         current_scope = determine_scope(&state, &options, backend);
         if let Some(ref scope) = current_scope {
-            if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
-                eprintln!("Warning: failed to load tags: {}", err);
+            if let Some(ref mut tag_manager) = tag_manager {
+                if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
+                    eprintln!("Warning: failed to load tags: {}", err);
+                }
+            }
+            if let Some(ref review_manager) = review_manager {
+                if let Err(err) = review_manager.load_for_scope(&mut state, scope) {
+                    eprintln!("Warning: failed to load reviewed hunks: {}", err);
+                }
             }
         }
     }
@@ -1104,10 +1173,10 @@ fn run_app_internal(
             if let Some(ref pr) = pr_info {
                 sync_viewed_files_from_github(pr, &mut state);
             }
-            apply_tag_filter(&mut state);
+            apply_filters(&mut state);
         }
 
-        let has_visible_files = if state.tag_filter.is_some() {
+        let has_visible_files = if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All {
             !state.sidebar_visible.is_empty()
         } else {
             !state.file_diffs.is_empty()
@@ -1133,6 +1202,7 @@ fn run_app_internal(
                 state.current_file,
                 &hunk_ranges,
                 state.tag_filter.as_ref(),
+                state.review_filter,
             );
             let hunk_count = matching_hunks.len();
             let footer_focused_hunk = state
@@ -1142,6 +1212,11 @@ fn run_app_internal(
                 TagFilter::Tag(tag) => format!("tag: {}", tag),
                 TagFilter::Untagged => "tag: untagged".to_string(),
             });
+            let review_filter_label = match state.review_filter {
+                ReviewFilter::Reviewed => Some("review: reviewed".to_string()),
+                ReviewFilter::Unreviewed => Some("review: unreviewed".to_string()),
+                ReviewFilter::All => None,
+            };
             let focused_tags = state
                 .focused_hunk
                 .and_then(|idx| state.get_hunk_tags(state.current_file, idx))
@@ -1152,6 +1227,13 @@ fn run_app_internal(
                         Some(tags.tags.join(", "))
                     }
                 });
+            let focused_review_label = state.focused_hunk.map(|idx| {
+                if state.is_hunk_reviewed(state.current_file, idx) {
+                    "reviewed".to_string()
+                } else {
+                    "unreviewed".to_string()
+                }
+            });
             state
                 .search_state
                 .update_matches(&side_by_side, state.diff_fullscreen);
@@ -1185,7 +1267,9 @@ fn run_app_internal(
                     &hunk_ranges,
                     footer_focused_hunk,
                     tag_filter_label,
+                    review_filter_label,
                     focused_tags,
+                    focused_review_label,
                     state.stacked_mode,
                     state.current_commit(),
                     state.current_commit_index,
@@ -1296,7 +1380,7 @@ fn run_app_internal(
                                         state.tag_inventory = tag_manager.tags().to_vec();
                                     }
                                 }
-                                apply_tag_filter(&mut state);
+                                apply_filters(&mut state);
                                 tag_editor = None;
                             }
                             TagEditorResult::Cancel => {
@@ -1363,7 +1447,7 @@ fn run_app_internal(
                                     state.reveal_file(file_index);
                                     state.select_file(file_index);
                                     if state.tag_filter.is_some() {
-                                        apply_tag_filter(&mut state);
+                                        apply_filters(&mut state);
                                     }
                                     if let Some(idx) =
                                         state.sidebar_visible_index_for_file(state.current_file)
@@ -1528,11 +1612,12 @@ fn run_app_internal(
                                                 persistence,
                                                 view_state.as_mut(),
                                                 tag_manager.as_mut(),
+                                                review_manager.as_ref(),
                                                 &mut state,
                                                 &options,
                                                 backend,
                                             );
-                                            apply_tag_filter(&mut state);
+                                            apply_filters(&mut state);
                                         }
                                     }
                                 }
@@ -1550,11 +1635,12 @@ fn run_app_internal(
                                                 persistence,
                                                 view_state.as_mut(),
                                                 tag_manager.as_mut(),
+                                                review_manager.as_ref(),
                                                 &mut state,
                                                 &options,
                                                 backend,
                                             );
-                                            apply_tag_filter(&mut state);
+                                            apply_filters(&mut state);
                                         }
                                     }
                                 }
@@ -1761,11 +1847,12 @@ fn run_app_internal(
                                             persistence,
                                             view_state.as_mut(),
                                             tag_manager.as_mut(),
+                                            review_manager.as_ref(),
                                             &mut state,
                                             &options,
                                             backend,
                                         );
-                                        apply_tag_filter(&mut state);
+                                        apply_filters(&mut state);
                                     }
                                 }
                             }
@@ -1781,11 +1868,12 @@ fn run_app_internal(
                                             persistence,
                                             view_state.as_mut(),
                                             tag_manager.as_mut(),
+                                            review_manager.as_ref(),
                                             &mut state,
                                             &options,
                                             backend,
                                         );
-                                        apply_tag_filter(&mut state);
+                                        apply_filters(&mut state);
                                     }
                                 }
                             }
@@ -1925,10 +2013,10 @@ fn run_app_internal(
                                         SidebarItem::Directory { path, .. } => {
                                             state.toggle_directory(&path);
                                             if state.tag_filter.is_some() {
-                                                apply_tag_filter(&mut state);
+                                                apply_filters(&mut state);
                                             }
                                             if state.tag_filter.is_some() {
-                                                apply_tag_filter(&mut state);
+                                                apply_filters(&mut state);
                                             }
                                             let visible_height =
                                                 terminal.size()?.height.saturating_sub(5) as usize;
@@ -2122,6 +2210,7 @@ fn run_app_internal(
                                     state.current_file,
                                     &hunks,
                                     state.tag_filter.as_ref(),
+                                    state.review_filter,
                                 );
                                 if !matching.is_empty() {
                                     let current_pos = state.focused_hunk.and_then(|idx| {
@@ -2169,6 +2258,7 @@ fn run_app_internal(
                                     state.current_file,
                                     &hunks,
                                     state.tag_filter.as_ref(),
+                                    state.review_filter,
                                 );
                                 if !matching.is_empty() {
                                     let current_pos = state.focused_hunk.and_then(|idx| {
@@ -2264,6 +2354,49 @@ fn run_app_internal(
                                 }
                             }
                         }
+                        KeyCode::Char('v') => {
+                            if let Some(hunk_index) = state.focused_hunk {
+                                let file_index = state.current_file;
+                                let reviewed = !state.is_hunk_reviewed(file_index, hunk_index);
+                                if let Some(diff) = state.file_diffs.get(file_index) {
+                                    if reviewed {
+                                        state.set_hunk_reviewed(super::state::HunkReview {
+                                            file_index,
+                                            hunk_index,
+                                            filename: diff.filename.clone(),
+                                        });
+                                    } else {
+                                        state.remove_hunk_reviewed(file_index, hunk_index);
+                                    }
+                                    if let (Some(ref review_manager), Some(scope)) =
+                                        (review_manager.as_ref(), current_scope.as_ref())
+                                    {
+                                        if let Err(err) = review_manager.set_hunk_reviewed(
+                                            &state,
+                                            file_index,
+                                            hunk_index,
+                                            reviewed,
+                                            scope,
+                                        ) {
+                                            eprintln!(
+                                                "Warning: failed to persist reviewed hunk: {}",
+                                                err
+                                            );
+                                        }
+                                    }
+                                    if state.tag_filter.is_some()
+                                        || state.review_filter != ReviewFilter::All
+                                    {
+                                        apply_filters(&mut state);
+                                        focus_first_matching_hunk(
+                                            &mut state,
+                                            visible_height,
+                                            max_scroll,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         KeyCode::Char('t') => {
                             if tag_editor.is_none() {
                                 if let Some(hunk_index) = state.focused_hunk {
@@ -2310,33 +2443,24 @@ fn run_app_internal(
                             let next_filter =
                                 next_tag_filter(state.tag_filter.as_ref(), &state.tag_inventory);
                             state.tag_filter = next_filter;
-                            apply_tag_filter(&mut state);
-                            if let Some(filter) = state.tag_filter.as_ref() {
-                                if let Some(diff) = state.file_diffs.get(state.current_file) {
-                                    let side_by_side = compute_side_by_side(
-                                        &diff.old_content,
-                                        &diff.new_content,
-                                        state.settings.tab_width,
-                                    );
-                                    let hunks = find_hunk_ranges(
-                                        &side_by_side,
-                                        state.settings.unified_context,
-                                    );
-                                    let matching =
-                                        matching_hunk_indices(&state, state.current_file, &hunks, Some(filter));
-                                    if let Some(first) = matching.first().copied() {
-                                        state.focused_hunk = Some(first);
-                                        state.scroll = adjust_scroll_for_hunk(
-                                            hunks[first].start,
-                                            state.scroll,
-                                            visible_height,
-                                            max_scroll,
-                                        );
-                                    } else {
-                                        state.focused_hunk = None;
-                                    }
-                                }
+                            apply_filters(&mut state);
+                            if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All
+                            {
+                                focus_first_matching_hunk(&mut state, visible_height, max_scroll);
                             }
+                        }
+                        KeyCode::Char('V') => {
+                            state.review_filter = next_review_filter(state.review_filter);
+                            apply_filters(&mut state);
+                            if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All
+                            {
+                                focus_first_matching_hunk(&mut state, visible_height, max_scroll);
+                            }
+                        }
+                        KeyCode::Char('C') => {
+                            state.tag_filter = None;
+                            state.review_filter = ReviewFilter::All;
+                            apply_filters(&mut state);
                         }
                         KeyCode::Char('r') => {
                             state.needs_reload = true;
@@ -2618,6 +2742,23 @@ fn run_app_internal(
                                             KeyBind {
                                                 key: "T",
                                                 description: "Cycle tag filter",
+                                            },
+                                        ],
+                                    },
+                                    KeyBindSection {
+                                        title: "Review",
+                                        bindings: vec![
+                                            KeyBind {
+                                                key: "v",
+                                                description: "Toggle hunk reviewed",
+                                            },
+                                            KeyBind {
+                                                key: "V",
+                                                description: "Cycle review filter",
+                                            },
+                                            KeyBind {
+                                                key: "C",
+                                                description: "Clear all filters",
                                             },
                                         ],
                                     },

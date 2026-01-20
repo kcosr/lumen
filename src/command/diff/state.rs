@@ -166,10 +166,25 @@ pub struct HunkTags {
     pub tags: Vec<String>,
 }
 
+/// Review state applied to a specific hunk in a file.
+#[derive(Clone)]
+pub struct HunkReview {
+    pub file_index: usize,
+    pub hunk_index: usize,
+    pub filename: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TagFilter {
     Tag(String),
     Untagged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewFilter {
+    Reviewed,
+    Unreviewed,
+    All,
 }
 
 pub struct AppState {
@@ -198,6 +213,9 @@ pub struct AppState {
     pub hunk_tags: Vec<HunkTags>,
     pub tag_inventory: Vec<String>,
     pub tag_filter: Option<TagFilter>,
+    // Review fields
+    pub reviewed_hunks: Vec<HunkReview>,
+    pub review_filter: ReviewFilter,
     // Stacked mode fields
     pub stacked_mode: bool,
     pub stacked_commits: Vec<StackedCommitInfo>,
@@ -265,6 +283,8 @@ impl AppState {
             hunk_tags: Vec::new(),
             tag_inventory: Vec::new(),
             tag_filter: None,
+            reviewed_hunks: Vec::new(),
+            review_filter: ReviewFilter::All,
             stacked_mode: false,
             stacked_commits: Vec::new(),
             current_commit_index: 0,
@@ -544,6 +564,20 @@ impl AppState {
             }
         });
 
+        // Filter and update reviewed hunks
+        self.reviewed_hunks.retain_mut(|hunk| {
+            if let Some(&(new_file_index, hunk_count)) = file_info.get(hunk.filename.as_str()) {
+                if hunk.hunk_index < hunk_count {
+                    hunk.file_index = new_file_index;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+
         // Convert viewed filenames back to indices in the new file_diffs
         self.viewed_files = self
             .file_diffs
@@ -645,6 +679,27 @@ impl AppState {
     pub fn remove_hunk_tags(&mut self, file_index: usize, hunk_index: usize) {
         self.hunk_tags
             .retain(|t| !(t.file_index == file_index && t.hunk_index == hunk_index));
+    }
+
+    pub fn is_hunk_reviewed(&self, file_index: usize, hunk_index: usize) -> bool {
+        self.reviewed_hunks
+            .iter()
+            .any(|h| h.file_index == file_index && h.hunk_index == hunk_index)
+    }
+
+    pub fn set_hunk_reviewed(&mut self, hunk_review: HunkReview) {
+        if !self
+            .reviewed_hunks
+            .iter()
+            .any(|h| h.file_index == hunk_review.file_index && h.hunk_index == hunk_review.hunk_index)
+        {
+            self.reviewed_hunks.push(hunk_review);
+        }
+    }
+
+    pub fn remove_hunk_reviewed(&mut self, file_index: usize, hunk_index: usize) {
+        self.reviewed_hunks
+            .retain(|h| !(h.file_index == file_index && h.hunk_index == hunk_index));
     }
 
     /// Format all annotations for export with full diff context

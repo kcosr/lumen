@@ -6,6 +6,7 @@ mod diff_algo;
 pub mod git;
 pub mod highlight;
 mod persistence;
+mod review;
 mod render;
 mod search;
 mod state;
