@@ -140,7 +140,7 @@ fn apply_view_state(state: &mut AppState, view_state: ViewStateFile) {
         }
     }
 
-    state.focused_panel = FocusedPanel::DiffView;
+    state.focused_panel = FocusedPanel::Sidebar;
 
     if let Some(diff) = state.file_diffs.get(state.current_file) {
         let side_by_side =
