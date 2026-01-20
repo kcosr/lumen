@@ -1173,6 +1173,24 @@ fn run_app_internal(
             if let Some(ref pr) = pr_info {
                 sync_viewed_files_from_github(pr, &mut state);
             }
+
+            if let Some(scope) = current_scope.as_ref() {
+                if let Some(ref mut persistence) = persistence {
+                    if let Err(err) = persistence.load_for_scope(&mut state, scope) {
+                        eprintln!("Warning: failed to reload annotations: {}", err);
+                    }
+                }
+                if let Some(ref mut tag_manager) = tag_manager {
+                    if let Err(err) = tag_manager.load_for_scope(&mut state, scope) {
+                        eprintln!("Warning: failed to reload tags: {}", err);
+                    }
+                }
+                if let Some(ref review_manager) = review_manager {
+                    if let Err(err) = review_manager.load_for_scope(&mut state, scope) {
+                        eprintln!("Warning: failed to reload reviewed hunks: {}", err);
+                    }
+                }
+            }
             apply_filters(&mut state);
         }
 

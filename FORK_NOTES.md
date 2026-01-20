@@ -112,6 +112,7 @@ Notes:
 - Tag hunks with `t` (modal lets you pick existing tags or type new ones).
 - Tags are per-scope; tag inventory is repo-level.
 - Filter hunks/files by tag with `T` (cycles tag → tag → untagged → all).
+- Tag metadata re-matches by line range + change context on reload; legacy entries fall back to stored hunk index.
 
 ### Storage Layout
 ```
@@ -134,6 +135,7 @@ Notes:
 - Toggle reviewed on a focused hunk with `v`.
 - Filter hunks/files by review state with `V` (reviewed → unreviewed → all).
 - Review filter combines with tag filter; `C` clears all filters.
+- Review metadata re-matches by line range + change context on reload; legacy entries fall back to stored hunk index.
 
 ### Storage Layout
 ```
