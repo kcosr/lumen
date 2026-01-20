@@ -490,6 +490,7 @@ fn handle_api_command(
     state: &mut AppState,
     current_scope: Option<&DiffScope>,
     persistence: Option<&mut PersistenceManager>,
+    tag_manager: Option<&mut TagManager>,
 ) {
     match command {
         ApiCommand::Status { respond_to } => {
@@ -717,6 +718,113 @@ fn handle_api_command(
                 ApiResponse {
                     status: 404,
                     body: serde_json::json!({ "error": "annotation not found" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::TagsList { respond_to } => {
+            let _ = respond_to.send(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "scope": scope_json(current_scope, state),
+                    "tags": state.tag_inventory,
+                }),
+            });
+        }
+        ApiCommand::TagsCurrent { respond_to } => {
+            let response = if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    let tags = state
+                        .get_hunk_tags(file_index, hunk_index)
+                        .map(|entry| entry.tags.clone())
+                        .unwrap_or_default();
+                    ApiResponse {
+                        status: 200,
+                        body: serde_json::json!({
+                            "scope": scope_json(current_scope, state),
+                            "file": state.file_diffs[file_index].filename.clone(),
+                            "file_index": file_index,
+                            "hunk_index": hunk_index,
+                            "line_range": [line_range.0, line_range.1],
+                            "tags": tags,
+                        }),
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
+                }
+            };
+            let _ = respond_to.send(response);
+        }
+        ApiCommand::TagsSet { tags, respond_to } => {
+            let response = if let Some(hunk_index) = state.focused_hunk {
+                let file_index = state.current_file;
+                if let Some(line_range) = compute_hunk_line_range(state, file_index, hunk_index) {
+                    if let (Some(scope), Some(tag_manager)) = (current_scope, tag_manager) {
+                        let tags = tags
+                            .into_iter()
+                            .map(|tag| tag.trim().to_string())
+                            .filter(|tag| !tag.is_empty())
+                            .collect::<Vec<String>>();
+                        if tags.is_empty() {
+                            state.remove_hunk_tags(file_index, hunk_index);
+                        } else if let Some(diff) = state.file_diffs.get(file_index) {
+                            state.set_hunk_tags(super::state::HunkTags {
+                                file_index,
+                                hunk_index,
+                                filename: diff.filename.clone(),
+                                tags: tags.clone(),
+                            });
+                        }
+                        if let Err(err) = tag_manager.set_hunk_tags(
+                            &state,
+                            file_index,
+                            hunk_index,
+                            tags.clone(),
+                            scope,
+                        ) {
+                            ApiResponse {
+                                status: 500,
+                                body: serde_json::json!({ "error": err.to_string() }),
+                            }
+                        } else {
+                            state.tag_inventory = tag_manager.tags().to_vec();
+                            ApiResponse {
+                                status: 200,
+                                body: serde_json::json!({
+                                    "scope": scope_json(current_scope, state),
+                                    "file": state.file_diffs[file_index].filename.clone(),
+                                    "file_index": file_index,
+                                    "hunk_index": hunk_index,
+                                    "line_range": [line_range.0, line_range.1],
+                                    "tags": tags,
+                                }),
+                            }
+                        }
+                    } else {
+                        ApiResponse {
+                            status: 503,
+                            body: serde_json::json!({ "error": "tag storage unavailable" }),
+                        }
+                    }
+                } else {
+                    ApiResponse {
+                        status: 404,
+                        body: serde_json::json!({ "error": "focused hunk not found" }),
+                    }
+                }
+            } else {
+                ApiResponse {
+                    status: 404,
+                    body: serde_json::json!({ "error": "no focused hunk" }),
                 }
             };
             let _ = respond_to.send(response);
@@ -958,6 +1066,7 @@ fn run_app_internal(
                     &mut state,
                     current_scope.as_ref(),
                     persistence.as_mut(),
+                    tag_manager.as_mut(),
                 );
             }
         }

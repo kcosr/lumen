@@ -39,6 +39,16 @@ pub enum ApiCommand {
         id: String,
         respond_to: Sender<ApiResponse>,
     },
+    TagsList {
+        respond_to: Sender<ApiResponse>,
+    },
+    TagsCurrent {
+        respond_to: Sender<ApiResponse>,
+    },
+    TagsSet {
+        tags: Vec<String>,
+        respond_to: Sender<ApiResponse>,
+    },
 }
 
 #[derive(Debug)]
@@ -132,6 +142,25 @@ pub fn start_api_server(
                     },
                     Err(response) => response,
                 },
+                (Method::Get, "/tags") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::TagsList { respond_to })
+                }
+                (Method::Get, "/tags/current") => {
+                    dispatch(&command_tx, |respond_to| ApiCommand::TagsCurrent { respond_to })
+                }
+                (Method::Post, "/tags/set") => match read_json_body(&mut request) {
+                    Ok(payload) => match string_array_field(&payload, "tags") {
+                        Some(tags) => dispatch(&command_tx, |respond_to| ApiCommand::TagsSet {
+                            tags,
+                            respond_to,
+                        }),
+                        None => ApiResponse {
+                            status: 400,
+                            body: json_error("missing tags field"),
+                        },
+                    },
+                    Err(response) => response,
+                },
                 _ => ApiResponse {
                     status: 404,
                     body: json_error("not found"),
@@ -195,6 +224,17 @@ fn string_field(payload: &Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
+}
+
+fn string_array_field(payload: &Value, key: &str) -> Option<Vec<String>> {
+    payload.get(key).and_then(|value| {
+        value.as_array().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+    })
 }
 
 fn json_error(message: &str) -> Value {

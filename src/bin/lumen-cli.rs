@@ -81,6 +81,43 @@ enum Commands {
 
     /// Check if lumen API is running
     Ping,
+
+    /// Tag operations for hunks
+    Tag {
+        #[command(subcommand)]
+        action: TagCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagCommands {
+    /// List available tags in the repo
+    List,
+
+    /// Show tags for the focused hunk
+    Current,
+
+    /// Set tags for the focused hunk
+    Set {
+        /// Tags to set on the focused hunk
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+
+    /// Add a tag to the focused hunk
+    Add {
+        /// Tag to add
+        tag: String,
+    },
+
+    /// Remove a tag from the focused hunk
+    Remove {
+        /// Tag to remove
+        tag: String,
+    },
+
+    /// Clear all tags from the focused hunk
+    Clear,
 }
 
 #[tokio::main]
@@ -157,6 +194,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 std::process::exit(1);
             }
         },
+        Commands::Tag { action } => match action {
+            TagCommands::List => {
+                let data = get(&cli.url, "/tags").await?;
+                print_output(&data, &cli.format, OutputKind::TagsList)?;
+            }
+            TagCommands::Current => {
+                let data = get(&cli.url, "/tags/current").await?;
+                print_output(&data, &cli.format, OutputKind::TagsCurrent)?;
+            }
+            TagCommands::Set { tags } => {
+                let payload = serde_json::json!({ "tags": normalize_tags(tags) });
+                let data = post(&cli.url, "/tags/set", payload).await?;
+                print_output(
+                    &data,
+                    &cli.format,
+                    OutputKind::TagsAction { action: "updated" },
+                )?;
+            }
+            TagCommands::Add { tag } => {
+                let mut tags = fetch_current_tags(&cli.url).await?;
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+                let payload = serde_json::json!({ "tags": normalize_tags(tags) });
+                let data = post(&cli.url, "/tags/set", payload).await?;
+                print_output(
+                    &data,
+                    &cli.format,
+                    OutputKind::TagsAction { action: "updated" },
+                )?;
+            }
+            TagCommands::Remove { tag } => {
+                let mut tags = fetch_current_tags(&cli.url).await?;
+                tags.retain(|t| t != &tag);
+                let payload = serde_json::json!({ "tags": normalize_tags(tags) });
+                let data = post(&cli.url, "/tags/set", payload).await?;
+                print_output(
+                    &data,
+                    &cli.format,
+                    OutputKind::TagsAction { action: "updated" },
+                )?;
+            }
+            TagCommands::Clear => {
+                let payload = serde_json::json!({ "tags": [] });
+                let data = post(&cli.url, "/tags/set", payload).await?;
+                print_output(
+                    &data,
+                    &cli.format,
+                    OutputKind::TagsAction { action: "cleared" },
+                )?;
+            }
+        },
     }
 
     Ok(())
@@ -191,6 +280,9 @@ enum OutputKind {
     CurrentFile,
     Annotations,
     Annotation { action: &'static str },
+    TagsList,
+    TagsCurrent,
+    TagsAction { action: &'static str },
     FullContext,
 }
 
@@ -206,6 +298,9 @@ fn print_output(
             OutputKind::CurrentFile => print_text_current_file(data),
             OutputKind::Annotations => print_text_annotations(data),
             OutputKind::Annotation { action } => print_text_annotation(data, action),
+            OutputKind::TagsList => print_text_tags_list(data),
+            OutputKind::TagsCurrent => print_text_tags_current(data),
+            OutputKind::TagsAction { action } => print_text_tags_action(data, action),
             OutputKind::FullContext => print_text_full_context(data),
         },
         OutputFormat::Json => print_json(data, false)?,
@@ -398,6 +493,48 @@ fn print_text_annotation(data: &Value, action: &str) {
     }
 }
 
+fn print_text_tags_list(data: &Value) {
+    let tags = extract_tags(data);
+    println!("tags: {}", tags.len());
+    if tags.is_empty() {
+        println!("- (none)");
+    } else {
+        for tag in tags {
+            println!("- {}", tag);
+        }
+    }
+}
+
+fn print_text_tags_current(data: &Value) {
+    let file = data.get("file").and_then(|v| v.as_str()).unwrap_or("-");
+    let file_index = data
+        .get("file_index")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let hunk_index = data
+        .get("hunk_index")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let line_range = format_range(data.get("line_range"));
+    let tags = extract_tags(data);
+
+    println!("file: {} ({})", file, file_index);
+    println!("hunk: {}", hunk_index);
+    println!("lines: {}", line_range.unwrap_or_else(|| "-".to_string()));
+    if tags.is_empty() {
+        println!("tags: (none)");
+    } else {
+        println!("tags: {}", tags.join(", "));
+    }
+}
+
+fn print_text_tags_action(data: &Value, action: &str) {
+    println!("tags {}:", action);
+    print_text_tags_current(data);
+}
+
 fn print_text_full_context(data: &Value) {
     println!("== status ==");
     if let Some(status) = data.get("status") {
@@ -428,6 +565,33 @@ fn print_context_block(label: &str, value: Option<&Value>) {
             }
         }
     }
+}
+
+fn extract_tags(data: &Value) -> Vec<String> {
+    data.get("tags")
+        .and_then(|v| v.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| tag.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn fetch_current_tags(base_url: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let data = get(base_url, "/tags/current").await?;
+    Ok(extract_tags(&data))
+}
+
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut normalized: Vec<String> = tags
+        .into_iter()
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn format_range(value: Option<&Value>) -> Option<String> {

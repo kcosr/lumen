@@ -132,3 +132,7 @@ TEST unified block line 2.
 ### UI Notes
 - Footer shows the active tag filter and tags for the focused hunk.
 - Sidebar list filters to files with matching hunks while a filter is active.
+
+### API + CLI
+- HTTP: `GET /tags`, `GET /tags/current`, `POST /tags/set` with `{ "tags": ["foo"] }`.
+- CLI: `lumen-cli tag list|current|set <tags..>|add <tag>|remove <tag>|clear`.
