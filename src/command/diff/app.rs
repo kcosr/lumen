@@ -448,6 +448,25 @@ fn apply_filters(state: &mut AppState) {
     }
 }
 
+fn focus_sidebar(state: &mut AppState) {
+    state.focused_panel = FocusedPanel::Sidebar;
+    state.show_sidebar = true;
+    if let Some(idx) = state.sidebar_visible_index_for_file(state.current_file) {
+        state.sidebar_selected = idx;
+        return;
+    }
+    if !matches!(
+        state.sidebar_item_at_visible(state.sidebar_selected),
+        Some(SidebarItem::File { .. })
+    ) {
+        if let Some(idx) = state.sidebar_visible.iter().position(|idx| {
+            matches!(state.sidebar_items[*idx], SidebarItem::File { .. })
+        }) {
+            state.sidebar_selected = idx;
+        }
+    }
+}
+
 fn focus_first_matching_hunk(state: &mut AppState, visible_height: usize, max_scroll: usize) {
     if let Some(diff) = state.file_diffs.get(state.current_file) {
         let side_by_side =
@@ -1487,6 +1506,23 @@ fn run_app_internal(
                 }
             }
             apply_filters(&mut state);
+            if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All {
+                let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
+                let max_scroll = if !state.file_diffs.is_empty() {
+                    let diff = &state.file_diffs[state.current_file];
+                    let total_lines = compute_side_by_side(
+                        &diff.old_content,
+                        &diff.new_content,
+                        state.settings.tab_width,
+                    )
+                    .len();
+                    total_lines.saturating_sub(visible_height.saturating_sub(5))
+                } else {
+                    0
+                };
+                focus_first_matching_hunk(&mut state, visible_height, max_scroll);
+                focus_sidebar(&mut state);
+            }
         }
 
         let has_visible_files = if state.tag_filter.is_some() || state.review_filter != ReviewFilter::All {
@@ -2761,6 +2797,12 @@ fn run_app_internal(
                             {
                                 focus_first_matching_hunk(&mut state, visible_height, max_scroll);
                             }
+                            focus_sidebar(&mut state);
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
                         }
                         KeyCode::Char('V') => {
                             state.review_filter = next_review_filter(state.review_filter);
@@ -2769,11 +2811,23 @@ fn run_app_internal(
                             {
                                 focus_first_matching_hunk(&mut state, visible_height, max_scroll);
                             }
+                            focus_sidebar(&mut state);
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
                         }
                         KeyCode::Char('C') => {
                             state.tag_filter = None;
                             state.review_filter = ReviewFilter::All;
                             apply_filters(&mut state);
+                            focus_sidebar(&mut state);
+                            save_view_state_for_scope(
+                                view_state.as_mut(),
+                                &state,
+                                current_scope.as_ref(),
+                            );
                         }
                         KeyCode::Char('r') => {
                             state.needs_reload = true;

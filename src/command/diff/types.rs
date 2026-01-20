@@ -99,8 +99,8 @@ pub enum ChangeType {
 
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum FocusedPanel {
-    Sidebar,
     #[default]
+    Sidebar,
     DiffView,
 }
 
