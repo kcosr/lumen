@@ -1,3 +1,4 @@
 /target
 .opencode/
 .lumen/
+.build-service/workspace-id
