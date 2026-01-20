@@ -35,3 +35,22 @@ Use `lumen-cli` commands only.
 - Treat annotations as collaborative threads: lines without a prefix are user notes, lines starting with `Agent: ` are agent responses.
 - When responding to an annotation, append two newlines and then a line starting with `Agent: `; keep the existing content intact unless explicitly asked to replace it.
 - Surface errors exactly and suggest retrying once the API is reachable.
+
+## Examples
+
+```bash
+# list hunks (all files)
+lumen-cli hunks
+
+# fetch details for a specific hunk
+lumen-cli hunk 2 5
+
+# annotate a specific hunk
+lumen-cli annotate "TICKET-123: please add validation" --file-index 2 --hunk-index 5
+
+# tag a specific hunk
+lumen-cli tag add TICKET-123 --file-index 2 --hunk-index 5
+
+# list hunks that have tags
+lumen-cli tags
+```
