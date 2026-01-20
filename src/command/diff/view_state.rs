@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::diff_algo::{compute_side_by_side, find_hunk_ranges};
 use super::persistence::DiffScope;
-use super::state::AppState;
+use super::state::{AppState, ReviewFilter, TagFilter};
 use super::types::FocusedPanel;
 
 const VIEW_STATE_VERSION: u32 = 1;
@@ -24,6 +24,10 @@ struct ViewStateFile {
     h_scroll: u16,
     focused_hunk: Option<usize>,
     viewed_files: Vec<String>,
+    #[serde(default)]
+    tag_filter: Option<String>,
+    #[serde(default)]
+    review_filter: Option<String>,
 }
 
 pub struct ViewStateManager {
@@ -75,6 +79,15 @@ impl ViewStateManager {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let tag_filter = state.tag_filter.as_ref().map(|filter| match filter {
+            TagFilter::Tag(tag) => format!("tag:{}", tag),
+            TagFilter::Untagged => "tag:untagged".to_string(),
+        });
+        let review_filter = match state.review_filter {
+            ReviewFilter::Reviewed => Some("reviewed".to_string()),
+            ReviewFilter::Unreviewed => Some("unreviewed".to_string()),
+            ReviewFilter::All => None,
+        };
         let view_state = ViewStateFile {
             version: VIEW_STATE_VERSION,
             last_updated: current_timestamp(),
@@ -90,6 +103,8 @@ impl ViewStateManager {
                 .iter()
                 .filter_map(|&idx| state.file_diffs.get(idx).map(|diff| diff.filename.clone()))
                 .collect(),
+            tag_filter,
+            review_filter,
         };
         let json = serde_json::to_string_pretty(&view_state)?;
         fs::write(path, json)?;
@@ -141,6 +156,17 @@ fn apply_view_state(state: &mut AppState, view_state: ViewStateFile) {
             }
         }
     }
+
+    state.tag_filter = match view_state.tag_filter.as_deref() {
+        Some(filter) if filter == "tag:untagged" => Some(TagFilter::Untagged),
+        Some(filter) if filter.starts_with("tag:") => Some(TagFilter::Tag(filter[4..].to_string())),
+        _ => None,
+    };
+    state.review_filter = match view_state.review_filter.as_deref() {
+        Some("reviewed") => ReviewFilter::Reviewed,
+        Some("unreviewed") => ReviewFilter::Unreviewed,
+        _ => ReviewFilter::All,
+    };
 }
 
 fn find_repo_root(start_dir: &Path) -> Option<PathBuf> {
