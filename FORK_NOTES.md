@@ -2,7 +2,6 @@
 
 This fork tracks incremental work that is not yet in upstream. Each section
 captures intent and behavior for the changes we add.
-TEST intro marker for unified hunk grouping.
 
 ## Annotation Persistence (Working Tree + Commit Scope)
 
@@ -11,8 +10,6 @@ Status: implemented in this fork.
 ### Summary
 - Persist annotations in a repo-local `.lumen/annotations/` directory.
 - Support working-tree scope and commit scope.
-TEST summary block line 1.
-TEST summary block line 2.
 - Migrate matching working-tree/orphan annotations into commit scope.
 - Save on every annotation change; keep unmatched annotations as orphans.
 
@@ -26,7 +23,6 @@ TEST summary block line 2.
 ### Scope Rules
 - Working tree uses `base_commit_id` (current HEAD at save time).
 - Commit scope uses the commit SHA for the diff being viewed.
-TEST scope note.
 - When HEAD changes, working-tree annotations are moved to orphans unless they
   match a commit hunk and can be migrated.
 - Orphans are kept forever unless manually deleted.
@@ -84,9 +80,6 @@ lumen-cli status
 Notes:
 - API responses return file paths relative to the server `cwd`.
 - Annotations are stored under `.lumen/annotations/` in the repo root.
-TEST notes block line 1.
-TEST notes block line 2.
-TEST notes block line 3.
 - Treat annotation content as collaborative: user text is unprefixed, agent responses should append new lines starting with `Agent: ` unless asked to replace.
 
 ### Non-goals
@@ -98,8 +91,6 @@ TEST notes block line 3.
 ### Summary
 - Configurable unified context (`diff.unified_context`, default `3`) for git-style hunk grouping.
 - CLI override: `lumen diff -U <n>` / `--unified <n>`.
-TEST unified block line 1.
-TEST unified block line 2.
 - Hunk ranges are merged after context expansion to avoid tiny hunks.
 
 ## Diff View State Persistence
